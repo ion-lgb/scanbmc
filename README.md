@@ -185,3 +185,7 @@ python3 -m unittest discover -p 'test_*.py' -v
 - 仅扫描本机可达的局域网，请在获得授权的网络中使用。
 - 程序只做**只读探测**：不尝试登录、不发送凭据、不做任何认证爆破。
 - IPMI OEM ID 到厂商的映射表为尽力而为，未收录的会原样显示为 `IANA-<编号>`。
+
+## 许可证
+
+本项目以 MIT 许可证开源，详见 [LICENSE-MIT](LICENSE-MIT)。
