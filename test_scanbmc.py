@@ -177,6 +177,73 @@ class TestIpmiPacket(unittest.TestCase):
         self.assertIsNone(sb.parse_ipmi_response(b"\x06\x00\xff\x06" + b"\x00" * 30))
 
 
+class TestDeviceId(unittest.TestCase):
+    @staticmethod
+    def _response(fw1=0x61, fw2=0x1A, ipmi_ver=0x02, oem=10876,
+                  product=0x0100, available=0x80, completion=0x00):
+        payload = bytes([
+            0x20, fw1, fw2, ipmi_ver,
+            oem & 0xFF, (oem >> 8) & 0xFF, (oem >> 16) & 0xFF,
+            product & 0xFF, (product >> 8) & 0xFF,
+            available, 0x00, 0x00,
+        ])
+        body = bytes([0x81, 0x1C, 0x63, 0x20, 0x00, 0x01, completion]) + payload
+        return b"\x06\x00\xff\x07" + b"\x00" * 9 + bytes([len(body)]) + body
+
+    def test_request_checksums(self):
+        """Get Device ID 请求报文两个校验和都要正确。"""
+        pkt = sb.IPMI_GET_DEVICE_ID
+        self.assertEqual(pkt[:4], b"\x06\x00\xff\x07")
+        self.assertEqual(pkt[13], len(pkt) - 14, "载荷长度字段与实际长度不符")
+        self.assertEqual(pkt[19], 0x01, "命令码应为 Get Device ID")
+        cs1 = (-(pkt[14] + pkt[15])) & 0xFF
+        self.assertEqual(pkt[16], cs1)
+        # 无请求数据：checksum2 覆盖 rqAddr+rqSeq+cmd 三个字节
+        cs2 = (-sum(pkt[17:20])) & 0xFF
+        self.assertEqual(pkt[20], cs2)
+
+    def test_parse_supermicro(self):
+        info = sb.parse_device_id(self._response())
+        self.assertIsNotNone(info)
+        self.assertTrue(info["ipmi"])
+        self.assertEqual(info["firmware"], "6.26")
+        self.assertEqual(info["ipmi_version"], "2.0")
+        self.assertEqual(info["manufacturer"], "Supermicro")
+        self.assertEqual(info["manufacturer_id"], 10876)
+        self.assertEqual(info["product_id"], 0x0100)
+        self.assertTrue(info["available"])
+
+    def test_parse_firmware_zero_padded(self):
+        """固件次版本要按两位补零显示（6.05 而不是 6.5）。"""
+        info = sb.parse_device_id(self._response(fw2=0x05))
+        self.assertEqual(info["firmware"], "6.05")
+
+    def test_parse_ipmi_v15(self):
+        info = sb.parse_device_id(self._response(ipmi_ver=0x15))
+        self.assertEqual(info["ipmi_version"], "1.5")
+
+    def test_parse_unknown_oem(self):
+        info = sb.parse_device_id(self._response(oem=99999))
+        self.assertEqual(info["manufacturer"], "IANA-99999")
+
+    def test_parse_not_available(self):
+        """bit7=0 表示设备处于固件更新/不可用状态。"""
+        info = sb.parse_device_id(self._response(available=0x00))
+        self.assertFalse(info["available"])
+
+    def test_nonzero_completion_still_ipmi(self):
+        info = sb.parse_device_id(self._response(completion=0xC1))
+        self.assertTrue(info["ipmi"])
+        self.assertEqual(info["completion_code"], 0xC1)
+
+    def test_garbage_rejected(self):
+        self.assertIsNone(sb.parse_device_id(b""))
+        self.assertIsNone(sb.parse_device_id(b"\x00" * 40))
+        # 命令码不是 0x01 的 IPMI 应答不应被认成 Device ID
+        auth_cap = TestIpmiPacket._response()
+        self.assertIsNone(sb.parse_device_id(auth_cap))
+
+
 class TestAsfPong(unittest.TestCase):
     def test_request_shape(self):
         pkt = sb.ASF_PRESENCE_PING
@@ -345,6 +412,69 @@ class TestClassify(unittest.TestCase):
         self.assertFalse(host.is_bmc)
         self.assertTrue(host.is_alive)
 
+    def test_device_id_alone_confirms(self):
+        """auth-cap 被静默，但 Get Device ID 应答足以确认是 BMC。"""
+        host = sb.HostResult(ip="10.0.0.13")
+        host.device_id = {"ipmi": True, "completion_code": 0, "firmware": "6.26",
+                          "ipmi_version": "2.0", "manufacturer_id": 10876,
+                          "manufacturer": "Supermicro", "product_id": 0x0100,
+                          "available": True}
+        sb.classify(host)
+        self.assertEqual(host.confidence, sb.CONF_CONFIRMED)
+        self.assertEqual(host.vendor, "Supermicro BMC")
+        self.assertTrue(any("固件 6.26" in e for e in host.evidence))
+        self.assertIn("623/udp", host.open_ports_str())
+
+    def test_device_id_enriches_confirmed_ipmi(self):
+        """auth-cap 已确认时，Device ID 只补充细节，不改厂商。"""
+        host = sb.HostResult(ip="10.0.0.14")
+        host.ipmi = {"ipmi": True, "versions": ["2.0"], "oem_vendor": "Dell"}
+        host.device_id = {"ipmi": True, "completion_code": 0, "firmware": "6.26",
+                          "ipmi_version": "2.0", "manufacturer_id": 10876,
+                          "manufacturer": "Supermicro", "product_id": 0x0100,
+                          "available": True}
+        sb.classify(host)
+        self.assertEqual(host.confidence, sb.CONF_CONFIRMED)
+        self.assertEqual(host.vendor, "Dell BMC", "已有厂商不被 Device ID 覆盖")
+        self.assertTrue(any("固件 6.26" in e for e in host.evidence))
+
+    def test_device_id_unavailable_warned(self):
+        host = sb.HostResult(ip="10.0.0.15")
+        host.device_id = {"ipmi": True, "completion_code": 0, "firmware": "",
+                          "ipmi_version": "", "manufacturer_id": 0,
+                          "manufacturer": "", "product_id": 0, "available": False}
+        sb.classify(host)
+        self.assertTrue(any("不可用" in e for e in host.evidence))
+
+    def test_cert_expired_warned(self):
+        host = sb.HostResult(ip="10.0.0.16")
+        host.ports = [sb.PortResult(port=443)]
+        host.redfish = {"port": 443, "status": 401, "vendor": "HPE",
+                        "version": "1.6.0", "_haystack": "{}",
+                        "cert": {"subject_cn": "idrac", "not_after": "2020-01-01",
+                                 "days_left": -200, "expired": True}}
+        sb.classify(host)
+        self.assertTrue(any("证书已过期" in e for e in host.evidence))
+
+    def test_cert_expiring_soon_warned(self):
+        host = sb.HostResult(ip="10.0.0.17")
+        host.ports = [sb.PortResult(port=443)]
+        host.web = [{"port": 443, "scheme": "https", "_haystack": "",
+                     "cert": {"subject_cn": "ilo", "not_after": "2026-08-01",
+                              "days_left": 10, "expired": False}}]
+        sb.classify(host)
+        self.assertTrue(any("天后过期" in e for e in host.evidence))
+
+    def test_cert_fine_recorded(self):
+        host = sb.HostResult(ip="10.0.0.18")
+        host.ports = [sb.PortResult(port=443)]
+        host.redfish = {"port": 443, "status": 401, "vendor": "",
+                        "version": "", "_haystack": "{}",
+                        "cert": {"subject_cn": "bmc-1", "not_after": "2030-01-01",
+                                 "days_left": 1200, "expired": False}}
+        sb.classify(host)
+        self.assertTrue(any("CN=bmc-1" in e for e in host.evidence))
+
 
 class TestBodyDecoding(unittest.TestCase):
     """很多 BMC 直接返回预压缩的 index.html.gz，不解压则页面指纹完全失效。"""
@@ -410,6 +540,85 @@ class TestBodyDecoding(unittest.TestCase):
 
     def test_empty_body_safe(self):
         self.assertEqual(sb._decode_body({"content-encoding": "gzip"}, b""), b"")
+
+
+class TestCertInfo(unittest.TestCase):
+    def test_parses_valid_cert(self):
+        cert = {
+            "subject": ((("commonName", "idrac-192.168.1.50"),),),
+            "issuer": ((("organizationName", "Dell Inc."),),),
+            "notAfter": "Dec 31 23:59:59 2030 GMT",
+        }
+        info = sb._cert_info(cert)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["subject_cn"], "idrac-192.168.1.50")
+        self.assertEqual(info["issuer"], "Dell Inc.")
+        self.assertEqual(info["not_after"], "2030-12-31")
+        self.assertGreater(info["days_left"], 0)
+        self.assertFalse(info["expired"])
+
+    def test_expired_cert(self):
+        cert = {"subject": (), "issuer": (), "notAfter": "Jan 01 00:00:00 2020 GMT"}
+        info = sb._cert_info(cert)
+        self.assertTrue(info["expired"])
+        self.assertLess(info["days_left"], 0)
+
+    def test_missing_or_garbage_rejected(self):
+        self.assertIsNone(sb._cert_info({}))
+        self.assertIsNone(sb._cert_info(None))
+        self.assertIsNone(sb._cert_info({"notAfter": "not a date"}))
+
+    # ---- DER 二进制证书（getpeercert 无详情时的兜底路径） ----
+
+    @staticmethod
+    def _der(tag: int, value: bytes) -> bytes:
+        n = len(value)
+        if n < 128:
+            return bytes([tag, n]) + value
+        b = n.to_bytes(4, "big").lstrip(b"\x00")
+        return bytes([tag, 0x80 | len(b)]) + b + value
+
+    @classmethod
+    def _make_cert(cls, cn: str, not_after: str, issuer: str = "issuer") -> bytes:
+        """手工构造一个最小 X.509 证书 DER（只含解析需要的字段）。"""
+        cn_oid = b"\x55\x04\x03"                       # 2.5.4.3 commonName
+
+        def name(text: str) -> bytes:
+            return cls._der(
+                0x30, cls._der(0x31, cls._der(0x30, cls._der(0x06, cn_oid) + cls._der(0x0C, text.encode())))
+            )
+
+        tbs = cls._der(
+            0x30,
+            cls._der(0xA0, cls._der(0x02, b"\x02")) +               # version
+            cls._der(0x02, b"\x01") +                               # serialNumber
+            cls._der(0x30, cls._der(0x06, b"\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b")) +  # signature
+            name(issuer) +
+            cls._der(0x30, cls._der(0x17, b"240101000000Z") + cls._der(0x17, not_after.encode())) +  # validity
+            name(cn) +
+            cls._der(0x30, b"\x00"),                                # SPKI 占位
+        )
+        return cls._der(0x30, tbs + cls._der(0x30, b"\x00") + cls._der(0x03, b"\x00"))
+
+    def test_der_cert_parsed(self):
+        cert = self._make_cert("test-bmc", "340101000000Z")   # UTCTime 2034-01-01
+        info = sb._cert_info_der(cert)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["subject_cn"], "test-bmc")
+        self.assertEqual(info["issuer"], "issuer")
+        self.assertEqual(info["not_after"], "2034-01-01")
+        self.assertFalse(info["expired"])
+
+    def test_der_cert_expired(self):
+        cert = self._make_cert("old-bmc", "200101000000Z")   # UTCTime 2020-01-01
+        info = sb._cert_info_der(cert)
+        self.assertTrue(info["expired"])
+        self.assertLess(info["days_left"], 0)
+
+    def test_der_garbage_rejected(self):
+        self.assertIsNone(sb._cert_info_der(b""))
+        self.assertIsNone(sb._cert_info_der(b"\x30\x03\x01\x02\x03"))
+        self.assertIsNone(sb._cert_info_der(b"not a cert at all"))
 
 
 class TestFdLimit(unittest.TestCase):

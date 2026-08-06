@@ -35,6 +35,24 @@ def make_ipmi_response(oem: int = 10876) -> bytes:
     return b"\x06\x00\xff\x07" + b"\x00" * 9 + bytes([len(body)]) + body
 
 
+def make_device_id_response(oem: int = 10876) -> bytes:
+    """构造 Get Device ID 应答：Supermicro、固件 6.26、IPMI 2.0、产品 ID 0x0100。"""
+    payload = bytes(
+        [
+            0x20,                                   # Device ID
+            0x61,                                   # 设备修订 1 + 固件修订主版本 6
+            0x1A,                                   # 固件修订次版本 26 → 6.26
+            0x02,                                   # IPMI 版本 2.0
+            oem & 0xFF, (oem >> 8) & 0xFF, (oem >> 16) & 0xFF,
+            0x00, 0x01,                             # 产品 ID 0x0100 (256)
+            0x80,                                   # 设备可用
+            0x00, 0x00,                             # 附加信息
+        ]
+    )
+    body = bytes([0x81, 0x1C, 0x63, 0x20, 0x00, 0x01, 0x00]) + payload
+    return b"\x06\x00\xff\x07" + b"\x00" * 9 + bytes([len(body)]) + body
+
+
 class FakeIpmiServer(threading.Thread):
     """UDP 服务：收到 IPMI 请求回 auth-cap 应答，收到 ASF Ping 回 Pong。"""
 
@@ -59,7 +77,11 @@ class FakeIpmiServer(threading.Thread):
                 break
             self.requests.append(data)
             if len(data) > 3 and data[3] == 0x07:
-                self.sock.sendto(make_ipmi_response(), addr)
+                # 按命令码区分：0x01 = Get Device ID，0x38 = Get Channel Auth Cap
+                if len(data) > 19 and data[19] == 0x01:
+                    self.sock.sendto(make_device_id_response(), addr)
+                else:
+                    self.sock.sendto(make_ipmi_response(), addr)
             elif len(data) > 3 and data[3] == 0x06:
                 pong = (
                     b"\x06\x00\xff\x06"
@@ -184,6 +206,13 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(host.ipmi["oem_vendor"], "Supermicro")
         self.assertTrue(host.ipmi["null_usernames"])
 
+        # Get Device ID 链路
+        self.assertIsNotNone(host.device_id, "应收到 Get Device ID 应答")
+        self.assertEqual(host.device_id["firmware"], "6.26")
+        self.assertEqual(host.device_id["ipmi_version"], "2.0")
+        self.assertEqual(host.device_id["manufacturer"], "Supermicro")
+        self.assertEqual(host.device_id["product_id"], 0x0100)
+
         # TCP + Web + Redfish 链路
         self.assertEqual([p.port for p in host.ports], [self.bmc_port])
         self.assertIsNotNone(host.redfish, "应识别出 Redfish")
@@ -229,9 +258,10 @@ class TestEndToEnd(unittest.TestCase):
         saved = sb.IPMI_UDP_PORT
         sb.IPMI_UDP_PORT = dead_port
         try:
-            ipmi, pong = sb.udp_probe("127.0.0.1", timeout=0.2, retries=1)
+            ipmi, pong, devid = sb.udp_probe("127.0.0.1", timeout=0.2, retries=1)
             self.assertIsNone(ipmi)
             self.assertFalse(pong)
+            self.assertIsNone(devid)
             self.assertGreaterEqual(dead.recv(2048) and 1, 1, "至少应收到一次探测包")
         finally:
             sb.IPMI_UDP_PORT = saved

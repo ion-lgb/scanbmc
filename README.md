@@ -20,6 +20,7 @@ python3 scanbmc.py
 | 证据 | 判定 | 说明 |
 |------|------|------|
 | UDP/623 IPMI RMCP 应答 | **确认** | 发送真实的 `Get Channel Authentication Capabilities` 命令，可解析出 IPMI 1.5/2.0 支持情况、认证方式和厂商 OEM ID |
+| UDP/623 IPMI Get Device ID | **确认** | 免认证命令，多数屏蔽 auth-cap 查询的 BMC 也会应答，可拿到固件版本、IPMI 版本、厂商与产品 ID |
 | UDP/623 ASF Presence Pong | **确认** | 部分 BMC 屏蔽 IPMI 命令但仍响应 ASF Ping |
 | `/redfish/v1/` 返回 JSON | **确认** | 返回 401/403 同样算确认——能给出 Redfish 服务根的只可能是 BMC |
 | Web 指纹命中厂商 | **可能** | Server 头、`<title>`、认证 realm、页面特征 |
@@ -39,6 +40,12 @@ python3 scanbmc.py
   页面指纹等于失效。程序支持 gzip / deflate / chunked，截断的响应也能解出可用部分。
 - **机箱型号 ≠ BMC 厂商**。`Product=4UGPUServer` 这类是机箱型号，会记进证据，
   但不会盖掉 Server 头识别出的固件厂商。
+- **Get Device ID 兜底确认**。部分 BMC（或防火墙策略）会静默丢弃
+  `Get Channel Authentication Capabilities` 查询，但对免认证的 `Get Device ID`（cmd 0x01）
+  照常应答。此时仅凭 Device ID 应答也能确认设备是 BMC，并给出固件版本与厂商。
+- **TLS 证书有效期告警**。HTTPS 端口握手后读取对端证书，解析到期时间：
+  证书已过期或 30 天内到期会在判定依据里标 `⚠`（GUI 中整行黄底）。
+  BMC 自签证书过期后 iDRAC/iLO 会拒绝连接，是高频运维事故。
 
 ### 默认扫描端口
 

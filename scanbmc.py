@@ -35,7 +35,8 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from datetime import datetime
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 __version__ = "1.0.0"
 
@@ -84,6 +85,22 @@ IPMI_GET_CHANNEL_AUTH_CAP = bytes(
         0x81, 0x00, 0x38,                                # rqAddr / rqSeq+lun / cmd 0x38
         0x8E, 0x04,                                      # 数据：通道 | 请求权限
         0xB5,                                            # checksum2
+    ]
+)
+
+# RMCP + IPMI v1.5 会话封装 + Get Device ID（App netFn, cmd 0x01，无请求数据）
+# 06 00 ff 07 | 00 | 00000000 | 00000000 | 07 | 20 18 c8 81 00 01 7e
+#                                              ^^ 载荷长度 7（IPMI 消息）
+IPMI_GET_DEVICE_ID = bytes(
+    [
+        0x06, 0x00, 0xFF, 0x07,                          # RMCP 头（class 0x07 = IPMI）
+        0x00,                                            # 认证类型 NONE
+        0x00, 0x00, 0x00, 0x00,                          # 会话序列号
+        0x00, 0x00, 0x00, 0x00,                          # 会话 ID
+        0x07,                                            # 载荷长度
+        0x20, 0x18, 0xC8,                                # rsAddr / netFn(App)+lun / checksum1
+        0x81, 0x00, 0x01,                                # rqAddr / rqSeq+lun / cmd 0x01
+        0x7E,                                            # checksum2 = -(0x81+0x00+0x01)
     ]
 )
 
@@ -249,6 +266,7 @@ class HostResult:
     ports: List[PortResult] = field(default_factory=list)
     ipmi: Optional[dict] = None          # IPMI RMCP 应答解析结果
     asf_pong: bool = False               # 是否收到 ASF Pong
+    device_id: Optional[dict] = None     # Get Device ID 应答解析结果
     redfish: Optional[dict] = None       # Redfish 探测结果
     web: List[dict] = field(default_factory=list)   # 各 Web 端口的指纹信息
     vendor: str = ""                     # 推断出的设备类型/厂商
@@ -257,7 +275,7 @@ class HostResult:
 
     @property
     def is_alive(self) -> bool:
-        return bool(self.ports) or self.ipmi is not None or self.asf_pong
+        return bool(self.ports) or self.ipmi is not None or self.asf_pong or self.device_id is not None
 
     @property
     def is_bmc(self) -> bool:
@@ -265,7 +283,7 @@ class HostResult:
 
     def open_ports_str(self) -> str:
         items = []
-        if self.ipmi is not None or self.asf_pong:
+        if self.ipmi is not None or self.asf_pong or self.device_id is not None:
             items.append("623/udp")
         items.extend(f"{p.port}/{p.proto}" for p in sorted(self.ports, key=lambda x: x.port))
         return ",".join(items)
@@ -278,6 +296,7 @@ class HostResult:
             "open_ports": self.open_ports_str(),
             "ipmi": self.ipmi,
             "asf_pong": self.asf_pong,
+            "device_id": self.device_id,
             "redfish": self.redfish,
             "web": self.web,
             "evidence": self.evidence,
@@ -645,15 +664,64 @@ def parse_asf_pong(data: bytes) -> Optional[dict]:
     return result
 
 
+def parse_device_id(data: bytes) -> Optional[dict]:
+    """解析 Get Device ID（cmd 0x01）应答。
+
+    该命令无需认证，大多数 BMC 即使屏蔽 auth-cap 查询也会应答，
+    可拿到固件版本、IPMI 版本、厂商 ID 与产品 ID。
+    """
+    if len(data) < 21 or data[0] != 0x06 or data[3] != 0x07:
+        return None
+    payload_len = data[13]
+    body = data[14 : 14 + payload_len] if payload_len else data[14:]
+    if len(body) < 7:
+        body = data[14:]
+    if len(body) < 7 or body[5] != 0x01:
+        return None
+    completion = body[6]
+    if completion != 0x00:
+        return {"ipmi": True, "completion_code": completion, "note": "Get Device ID 被拒绝"}
+    payload = body[7:]
+    if len(payload) < 9:
+        return {"ipmi": True, "completion_code": 0, "note": "Get Device ID 应答不完整"}
+
+    fw_major = (payload[1] >> 4) & 0x0F
+    fw_minor = payload[2]
+    ipmi_ver = payload[3]
+    manufacturer = payload[4] | (payload[5] << 8) | (payload[6] << 16)
+    product_id = payload[7] | (payload[8] << 8)
+
+    if ipmi_ver == 0x02:
+        ver_str = "2.0"
+    elif ipmi_ver == 0x00:
+        ver_str = ""
+    else:
+        ver_str = f"{ipmi_ver >> 4}.{ipmi_ver & 0x0F}"
+
+    return {
+        "ipmi": True,
+        "completion_code": 0,
+        "device_id": payload[0],
+        "firmware": f"{fw_major}.{fw_minor:02d}",
+        "ipmi_version": ver_str,
+        "manufacturer_id": manufacturer,
+        "manufacturer": IPMI_OEM_IDS.get(manufacturer, f"IANA-{manufacturer}" if manufacturer else ""),
+        "product_id": product_id,
+        "available": bool(payload[9] & 0x80) if len(payload) > 9 else True,
+    }
+
+
 def udp_probe(
     ip: str, timeout: float, retries: int, stats: Optional["ProbeStats"] = None
-) -> Tuple[Optional[dict], bool]:
-    """UDP/623 探测：并行发 IPMI 命令与 ASF Ping（两者互不依赖）。
+) -> Tuple[Optional[dict], bool, Optional[dict]]:
+    """UDP/623 探测：并行发 IPMI auth-cap、ASF Ping 与 Get Device ID（互不依赖）。
 
-    顺序发送时无响应地址要等 2×(retries+1)×timeout；并行后最坏减半，
+    顺序发送时无响应地址要等 3×(retries+1)×timeout；并行后最坏只等一轮，
     对“黑洞”网段（不回 ICMP 不可达）提速明显。
+
+    返回 (auth_cap, 是否收到 Pong, device_id)。
     """
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="udp-probe") as pool:
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="udp-probe") as pool:
         f_ipmi = pool.submit(
             _udp_send, ip, IPMI_GET_CHANNEL_AUTH_CAP, timeout, retries,
             parse_ipmi_response, stats,
@@ -661,9 +729,13 @@ def udp_probe(
         f_pong = pool.submit(
             _udp_send, ip, ASF_PRESENCE_PING, timeout, retries, parse_asf_pong, stats
         )
+        f_devid = pool.submit(
+            _udp_send, ip, IPMI_GET_DEVICE_ID, timeout, retries, parse_device_id, stats
+        )
         ipmi_info = f_ipmi.result()
         pong = f_pong.result()
-    return ipmi_info, pong is not None
+        devid = f_devid.result()
+    return ipmi_info, pong is not None, devid
 
 
 def _udp_send(ip: str, packet: bytes, timeout: float, retries: int, parser,
@@ -740,6 +812,155 @@ def _decode_body(headers: Dict[str, str], body: bytes) -> bytes:
     return body
 
 
+def _der_children(data: bytes) -> Iterator[Tuple[int, bytes]]:
+    """遍历 DER 编码的顶层 TLV 序列。格式非法时抛 ValueError。"""
+    i = 0
+    n = len(data)
+    while i < n:
+        tag = data[i]
+        i += 1
+        if i >= n:
+            raise ValueError("DER 截断")
+        length = data[i]
+        i += 1
+        if length & 0x80:
+            num = length & 0x7F
+            if num > 4 or i + num > n:
+                raise ValueError("DER 长度字段非法")
+            length = int.from_bytes(data[i : i + num], "big")
+            i += num
+        if i + length > n:
+            raise ValueError("DER 截断")
+        yield tag, data[i : i + length]
+        i += length
+
+
+def _der_time(text: str) -> Optional[datetime]:
+    """解析 DER 里的 UTCTime / GeneralizedTime。"""
+    text = text.strip().rstrip("Z")
+    try:
+        if len(text) == 12:  # YYMMDDHHMMSS
+            yy = int(text[:2])
+            year = 2000 + yy if yy < 50 else 1900 + yy
+            return datetime.strptime(f"{year}{text[2:]}", "%Y%m%d%H%M%S")
+        if len(text) == 14:  # YYYYMMDDHHMMSS
+            return datetime.strptime(text, "%Y%m%d%H%M%S")
+    except ValueError:
+        pass
+    return None
+
+
+def _name_field(name_der: bytes, *oids: bytes) -> str:
+    """从 X.509 Name 的 DER 里取指定 OID 的属性值（CN=2.5.4.3、O=2.5.4.10）。"""
+    try:
+        for _tag, rdn in _der_children(name_der):           # SET OF
+            for _t2, ava in _der_children(rdn):             # SEQUENCE
+                fields = list(_der_children(ava))
+                if len(fields) != 2 or fields[0][0] != 0x06:
+                    continue
+                if fields[0][1] in oids:
+                    tag, value = fields[1]
+                    if tag == 0x0C:                         # UTF8String
+                        return value.decode("utf-8", "replace").strip()
+                    return value.decode("latin-1", "replace").strip()
+    except ValueError:
+        pass
+    return ""
+
+
+def _parse_x509_der(der: bytes) -> Optional[dict]:
+    """最小 X.509 DER 解析：取有效期与 subject/issuer 名称。
+
+    不依赖 ssl 私有 API（各 Python 版本的 _test_decode_cert 签名不一致），
+    解析不了就返回 None，不影响扫描主流程。
+    """
+    try:
+        # Certificate SEQUENCE → 第一个子元素才是 tbsCertificate
+        cert_value = next(_der_children(der))[1]
+        tbs = next(_der_children(cert_value))[1]
+        seq_index = 0
+        issuer = subject = validity = None
+        for tag, value in _der_children(tbs):
+            if tag == 0xA0:                                 # version [0]，跳过
+                continue
+            if tag != 0x30:
+                continue                                    # serialNumber 等
+            seq_index += 1
+            if seq_index == 2:
+                issuer = value
+            elif seq_index == 3:
+                validity = value
+            elif seq_index == 4:
+                subject = value
+        if validity is None or subject is None:
+            return None
+        times = [
+            _der_time(v.decode("ascii", "replace"))
+            for tag, v in _der_children(validity)
+            if tag in (0x17, 0x18)
+        ]
+        not_after = times[1] if len(times) >= 2 else None
+        if not_after is None:
+            return None
+        return {
+            "subject_cn": _name_field(subject, b"\x55\x04\x03"),
+            "issuer": _name_field(issuer, b"\x55\x04\x0a", b"\x55\x04\x03"),
+            "not_after": not_after,
+        }
+    except (ValueError, StopIteration):
+        return None
+
+
+def _cert_summary(not_after: datetime, subject_cn: str, issuer: str) -> dict:
+    """把证书关键字段整理成展示用的摘要，并计算剩余天数。"""
+    days_left = (not_after - datetime.utcnow()).days
+    return {
+        "subject_cn": subject_cn,
+        "issuer": issuer,
+        "not_after": not_after.strftime("%Y-%m-%d"),
+        "days_left": days_left,
+        "expired": days_left < 0,
+    }
+
+
+def _cert_info(cert: dict) -> Optional[dict]:
+    """从 ssl 的 getpeercert() 结果里提取证书摘要。
+
+    BMC 自签证书普遍有效期只有几年，过期后 iDRAC/iLO 等会直接拒绝
+    浏览器连接，是高频运维事故——这里把到期时间与剩余天数算出来。
+    """
+    if not cert or "notAfter" not in cert:
+        return None
+    try:
+        not_after = datetime.strptime(
+            cert["notAfter"].replace("GMT", "").strip(), "%b %d %H:%M:%S %Y"
+        )
+    except ValueError:
+        return None
+
+    def _first(parts: object, key: str) -> str:
+        for part in parts or ():
+            for k, v in part:
+                if k == key:
+                    return v
+        return ""
+
+    return _cert_summary(
+        not_after,
+        _first(cert.get("subject"), "commonName"),
+        _first(cert.get("issuer"), "organizationName")
+        or _first(cert.get("issuer"), "commonName"),
+    )
+
+
+def _cert_info_der(der: bytes) -> Optional[dict]:
+    """从 DER 二进制证书提取摘要（getpeercert() 无详情时的兜底）。"""
+    parsed = _parse_x509_der(der)
+    if parsed is None:
+        return None
+    return _cert_summary(parsed["not_after"], parsed["subject_cn"], parsed["issuer"])
+
+
 def _http_request(ip: str, port: int, tls: bool, path: str, timeout: float) -> Optional[dict]:
     """发一个最小化的 HTTP GET，返回状态行 / 头 / 部分正文。"""
     host = f"[{ip}]" if ":" in ip else ip
@@ -775,6 +996,19 @@ def _http_request(ip: str, port: int, tls: bool, path: str, timeout: float) -> O
             except ssl.SSLError:
                 pass
             sock = ctx.wrap_socket(sock, server_hostname=None, do_handshake_on_connect=True)
+        cert = None
+        if tls:
+            try:
+                cert = _cert_info(sock.getpeercert())
+                if cert is None:
+                    # server_hostname=None 时 CPython 不解析证书详情，getpeercert()
+                    # 返回空 dict。不传 SNI 是为了兼容部分老 BMC 的 TLS 栈，
+                    # 证书信息改用 DER 二进制格式兜底解析。
+                    der = sock.getpeercert(binary_form=True)
+                    if der:
+                        cert = _cert_info_der(der)
+            except (ssl.SSLError, ValueError):
+                cert = None
         sock.sendall(request)
 
         chunks = []
@@ -826,6 +1060,7 @@ def _http_request(ip: str, port: int, tls: bool, path: str, timeout: float) -> O
         "headers": headers,
         "title": title,
         "body": body[:8192].decode("utf-8", "replace"),
+        "cert": cert,
     }
 
 
@@ -846,6 +1081,7 @@ def web_fingerprint(ip: str, port: int, tls: bool, timeout: float, retries: int)
         "title": resp["title"],
         "location": resp["headers"].get("location", ""),
         "realm": resp["headers"].get("www-authenticate", ""),
+        "cert": resp.get("cert"),
     }
     haystack = " ".join(
         [
@@ -886,6 +1122,7 @@ def redfish_probe(ip: str, port: int, tls: bool, timeout: float, retries: int) -
         "vendor": "",
         "product": "",
         "version": "",
+        "cert": resp.get("cert"),
     }
     try:
         doc = json.loads(body)
@@ -939,6 +1176,35 @@ def classify(host: HostResult) -> None:
         evidence.append("ASF Presence Pong (UDP/623)")
         confidence = CONF_CONFIRMED
 
+    # 证据 1b：Get Device ID（真实 IPMI 应答；auth-cap 被拒/静默时兜底）
+    if host.device_id:
+        dev = host.device_id
+        if dev.get("completion_code") == 0:
+            desc = "IPMI Get Device ID 应答"
+            if dev.get("firmware"):
+                desc += f" (固件 {dev['firmware']})"
+            if dev.get("ipmi_version"):
+                desc += f" (IPMI {dev['ipmi_version']})"
+            evidence.append(desc)
+            if dev.get("product_id"):
+                evidence.append(f"产品 ID=0x{dev['product_id']:04X}")
+            if not dev.get("available", True):
+                evidence.append("⚠ 设备处于固件更新/不可用状态")
+            if host.ipmi is None:
+                # auth-cap 没拿到应答，但 Device ID 足以确认是 IPMI 设备
+                confidence = CONF_CONFIRMED
+            mfr = dev.get("manufacturer") or ""
+            if mfr:
+                if mfr.startswith("IANA-"):
+                    evidence.append(
+                        f"Get Device ID 厂商 ID={dev.get('manufacturer_id')}（未收录）"
+                    )
+                elif not vendor:
+                    vendor = f"{mfr} BMC"
+                    evidence.append(
+                        f"Get Device ID 厂商 ID={dev.get('manufacturer_id')} → {mfr}"
+                    )
+
     # 证据 2：Redfish
     if host.redfish:
         rv = host.redfish
@@ -984,6 +1250,27 @@ def classify(host: HostResult) -> None:
             evidence.append(
                 f"{w['scheme']}://{host.ip}:{w['port']} "
                 f"server={w.get('server') or '-'} title={w.get('title') or '-'}"
+            )
+
+    # 证据 3b：TLS 证书有效期（HTTPS 端口）。证书过期是 BMC 高频运维事故。
+    cert = None
+    if host.redfish and host.redfish.get("cert"):
+        cert = host.redfish["cert"]
+    if cert is None:
+        for w in host.web:
+            if w.get("cert"):
+                cert = w["cert"]
+                break
+    if cert:
+        if cert.get("expired"):
+            evidence.append(f"⚠ TLS 证书已过期（{cert.get('not_after')}）")
+        elif cert.get("days_left", 365) <= 30:
+            evidence.append(
+                f"⚠ TLS 证书将于 {cert.get('days_left')} 天后过期（{cert.get('not_after')}）"
+            )
+        else:
+            evidence.append(
+                f"TLS 证书 CN={cert.get('subject_cn') or '-'} 有效期至 {cert.get('not_after')}"
             )
 
     # 证据 4：端口组合（弱）
@@ -1074,6 +1361,14 @@ class ScanConfig:
     progress_cb: Optional[Callable[[int, int, str], None]] = None
 
 
+def _shutdown_pool(pool: ThreadPoolExecutor) -> None:
+    """关闭线程池：Python 3.8 的 shutdown() 没有 cancel_futures 参数。"""
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        pool.shutdown(wait=False)
+
+
 def scan(
     targets: Sequence[str], cfg: ScanConfig, stats: Optional[ProbeStats] = None
 ) -> List[HostResult]:
@@ -1103,10 +1398,11 @@ def scan(
         kind, ip, port = task
         try:
             if kind == "udp":
-                ipmi, pong = udp_probe(ip, cfg.timeout, cfg.retries, stats=stats)
+                ipmi, pong, devid = udp_probe(ip, cfg.timeout, cfg.retries, stats=stats)
                 with lock:
                     hosts[ip].ipmi = ipmi
                     hosts[ip].asf_pong = pong
+                    hosts[ip].device_id = devid
             else:
                 res = tcp_probe(ip, port, cfg.timeout, cfg.retries, stats=stats)
                 if res:
@@ -1130,7 +1426,7 @@ def scan(
             if cfg.cancel_event is not None and cfg.cancel_event.is_set():
                 break
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        _shutdown_pool(pool)
     progress.finish()
     cancelled = cfg.cancel_event is not None and cfg.cancel_event.is_set()
 
@@ -1188,7 +1484,7 @@ def scan(
                 if cfg.cancel_event is not None and cfg.cancel_event.is_set():
                     break
         finally:
-            pool2.shutdown(wait=False, cancel_futures=True)
+            _shutdown_pool(pool2)
         progress2.finish()
 
     results = [h for h in hosts.values() if h.is_alive]
