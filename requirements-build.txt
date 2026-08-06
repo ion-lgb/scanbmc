@@ -1,0 +1,4 @@
+# 构建期依赖（仅供 GitHub Actions 打包 CI 与本地打包使用；扫描核心仍为零第三方依赖）
+# PySide6 <7：规避未来大版本不兼容；pyinstaller <7：6.x 的 onefile+windowed 在 7.0 将变为报错
+PySide6>=6.5,<7
+pyinstaller<7
