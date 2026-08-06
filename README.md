@@ -188,4 +188,4 @@ python3 -m unittest discover -p 'test_*.py' -v
 
 ## 许可证
 
-本项目以 MIT 许可证开源，详见 [LICENSE-MIT](LICENSE-MIT)。
+本项目以 MIT 许可证开源，详见 [LICENSE](LICENSE)。
