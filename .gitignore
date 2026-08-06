@@ -1,0 +1,15 @@
+# 虚拟环境 / 构建产物
+.venv/
+build/
+dist/
+.pyinstaller_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# 工具会话状态
+.reasonix/
