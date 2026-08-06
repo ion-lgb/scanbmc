@@ -640,7 +640,10 @@ class TestFdLimit(unittest.TestCase):
         self.assertEqual(sb.cap_workers(128, 0), 128)
 
     def test_ensure_fd_limit_raises_soft_limit(self):
-        import resource
+        try:
+            import resource
+        except ImportError:
+            self.skipTest("当前平台无 resource 模块（如 Windows）")
 
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         try:
@@ -668,7 +671,11 @@ class TestProbeStats(unittest.TestCase):
         self.assertEqual(stats.total, 10)
         self.assertEqual(stats.systemic_failures, 9)
         self.assertAlmostEqual(stats.systemic_ratio(), 0.9)
-        self.assertIn("sys:ENETDOWN", stats.summary())
+        summary = stats.summary()
+        # Windows 上 socket 错误码名为 WSAENETDOWN，其余平台为 ENETDOWN
+        self.assertTrue(
+            "sys:ENETDOWN" in summary or "sys:WSAENETDOWN" in summary, summary
+        )
 
     def test_empty_lan_addresses_are_not_a_failure(self):
         """扫一整段网络时，空地址返回 EHOSTDOWN 是正常现象，不能误报为故障。"""

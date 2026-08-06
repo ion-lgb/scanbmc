@@ -1641,6 +1641,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # Windows 控制台默认 cp1252 等编码无法打印中文，强制 UTF-8（Python 3.7+ 支持）
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
     args = build_parser().parse_args(argv)
     log = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr))
 
