@@ -11,12 +11,11 @@ Cisco IMC、Fujitsu iRMC、浪潮、H3C HDM、OpenBMC 等常见 BMC。
 
 | 文件 | 平台 |
 |------|------|
-| `ScanBMC-<版本>-macos-arm64` | macOS Apple Silicon（M1 及以上） |
-| `ScanBMC-<版本>-macos-x86_64` | macOS Intel |
+| `ScanBMC-<版本>-macos-universal2` | macOS，Intel 与 Apple Silicon 通用 |
 | `ScanBMC-<版本>-windows-x86_64.exe` | Windows 10/11 |
 | `ScanBMC-<版本>-linux-x86_64` | Linux x86_64 |
 
-推送形如 `v1.0.0` 的 git tag 即触发 GitHub Actions 自动构建这四个平台并发布 Release（也可在 Actions 页面手动触发构建）。构建脚本见 `.github/workflows/build.yml`。
+推送形如 `v1.0.0` 的 git tag 即触发 GitHub Actions 自动构建这三大平台并发布 Release（也可在 Actions 页面手动触发构建）。构建脚本见 `.github/workflows/build.yml`。
 
 各平台首次运行的注意事项：
 

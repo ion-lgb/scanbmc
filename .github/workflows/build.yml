@@ -1,7 +1,7 @@
 name: 打包发布 (Build & Release)
 
 # 触发方式：
-#   1. 推送 tag（v1.0.0 之类）→ 自动构建四个平台的单文件并发布到 Releases
+#   1. 推送 tag（v1.0.0 之类）→ 自动构建单文件并发布到 Releases
 #   2. 手动触发 workflow_dispatch → 只构建并上传 Artifact，不发布 Release
 on:
   push:
@@ -25,12 +25,11 @@ jobs:
       fail-fast: false   # 一个平台失败不耽误其他平台
       matrix:
         include:
-          - os: macos-14        # Apple Silicon
+          # macOS 用 universal2 构建：一个文件同时兼容 Apple Silicon 与 Intel，
+          # 避免依赖接近退役、排队严重的 macos-13 (x86_64) runner
+          - os: macos-14
             os_name: macos
-            arch: arm64
-          - os: macos-13        # Intel（若 GitHub 退役 macos-13，删除此行即可）
-            os_name: macos
-            arch: x86_64
+            arch: universal2
           - os: windows-latest
             os_name: windows
             arch: x86_64
@@ -49,8 +48,9 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-build.txt
 
-      - name: 安装构建依赖
+      - name: 安装构建依赖（macOS 跳过，打包用下方 universal2 Python）
         shell: bash
+        if: runner.os != 'macOS'
         run: python3 -m pip install -r requirements-build.txt
 
       - name: 安装 Qt 运行依赖 (Linux)
@@ -66,13 +66,25 @@ jobs:
         shell: bash
         run: python3 -m unittest discover -p 'test_*.py'
 
+      - name: 安装 universal2 Python 与构建依赖 (macOS)
+        shell: bash
+        if: runner.os == 'macOS'
+        run: |
+          # PyInstaller 的 --target-arch universal2 需要 universal2 解释器；
+          # GitHub 自带的 Python 是单架构，改装 python.org 官方 universal2 包
+          curl -sSL -o /tmp/python-3.12.10-macos11.pkg \
+            https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg
+          sudo installer -pkg /tmp/python-3.12.10-macos11.pkg -target /
+          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 --version
+          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 -m pip install -r requirements-build.txt
+
       - name: 计算版本号
         shell: bash
         run: |
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             VER="${GITHUB_REF_NAME#v}"
           else
-            VER=$(python3 -c "import re; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('scanbmc.py').read()).group(1))")
+            VER=$(python3 -c "import re; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('scanbmc.py', encoding='utf-8').read()).group(1))")
           fi
           echo "VER=${VER}" >> "$GITHUB_ENV"
 
@@ -85,7 +97,17 @@ jobs:
           # 注意 PyInstaller 6.x 会对 macOS 的 "onefile + windowed" 组合打弃用警告，
           # 并在 dist/ 额外生成一个 .app——无碍，重命名步骤只取单文件；
           # 若未来 PyInstaller 7.x 将其变为报错，再改用 onedir .app 方案。
-          python3 -m PyInstaller --noconfirm --clean --onefile --windowed \
+          # macOS 用 universal2 Python 构建 fat 二进制，Intel/Apple Silicon 通用。
+          PY="python3"
+          TARGET=""
+          ARGS="--windowed"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            PY=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12
+            TARGET="--target-arch universal2"
+          elif [ "$RUNNER_OS" = "Linux" ]; then
+            ARGS=""
+          fi
+          $PY -m PyInstaller --noconfirm --clean --onefile $ARGS $TARGET \
             --specpath build/spec --name ScanBMC scanbmc_gui.py
           ls -lh dist/
 
@@ -134,8 +156,7 @@ jobs:
 
             下载对应平台的单个文件即可直接运行，无需安装 Python 或任何依赖。
 
-            - **macos-arm64**：Apple Silicon（M1/M2/M3/M4）Mac
-            - **macos-x86_64**：Intel Mac
+            - **macos-universal2**：Intel 与 Apple Silicon（M 系列）Mac 通用
             - **windows-x86_64**：Windows 10/11（.exe）
             - **linux-x86_64**：Linux（需系统自带常见 Qt 运行库，见 README）
 
