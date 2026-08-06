@@ -5,6 +5,27 @@
 支持识别 Dell iDRAC、HPE iLO、Supermicro / AMI MegaRAC、华为 iBMC、联想 XClarity、
 Cisco IMC、Fujitsu iRMC、浪潮、H3C HDM、OpenBMC 等常见 BMC。
 
+## 下载即用（GUI 单文件版）
+
+不想装 Python？到 [Releases](https://github.com/ion-lgb/scanbmc/releases) 下载对应平台的一个文件，双击即可运行（无需安装任何依赖）：
+
+| 文件 | 平台 |
+|------|------|
+| `ScanBMC-<版本>-macos-arm64` | macOS Apple Silicon（M1 及以上） |
+| `ScanBMC-<版本>-macos-x86_64` | macOS Intel |
+| `ScanBMC-<版本>-windows-x86_64.exe` | Windows 10/11 |
+| `ScanBMC-<版本>-linux-x86_64` | Linux x86_64 |
+
+推送形如 `v1.0.0` 的 git tag 即触发 GitHub Actions 自动构建这四个平台并发布 Release（也可在 Actions 页面手动触发构建）。构建脚本见 `.github/workflows/build.yml`。
+
+各平台首次运行的注意事项：
+
+- **macOS**：未签名应用会被 Gatekeeper 拦截，首次请右键点文件 →「打开」，或在终端执行 `xattr -cr <文件>` 后再双击。
+- **Windows**：SmartScreen 提示时点「更多信息 → 仍要运行」（未签名应用属正常现象）。
+- **Linux**：需要系统带常见 Qt 运行库；Ubuntu/Debian 若提示缺少库，执行 `sudo apt install libxcb-cursor0 libegl1`。
+
+只想用命令行？`python3 scanbmc.py` 零依赖直接跑，见下文。
+
 ## 快速开始
 
 ```bash

@@ -15,6 +15,7 @@
 - 运行(GUI)：`./.venv/bin/python scanbmc_gui.py`（PySide6，依赖 `.venv`）。
 - 测试：`python3 -m unittest discover -p 'test_*.py' -v`（85 个用例，约 4s）。GUI 验证：`SCANBMC_GUI_SMOKE=1 .venv/bin/python scanbmc_gui.py`（2 秒自动退出冒烟）。
 - 打包 .app：`./build_app.sh` → `dist/ScanBMC.app`（pyinstaller `--windowed`；缓存重定向到 `.pyinstaller_cache`，因沙箱可能禁止写 `~/Library/Application Support`）。
+- 全平台单文件打包：GitHub Actions `.github/workflows/build.yml`（push tag `v*` 触发，四平台 PyInstaller `--onefile` 并发布 Release；也可 `workflow_dispatch` 手动触发）。
 - 环境：Homebrew python 是 externally-managed，装依赖必须用 venv（`python3 -m venv .venv && .venv/bin/pip install PySide6 pyinstaller`），直接 pip install 会被 PEP 668 拒绝。
 - 无 lint / build / 打包配置，无依赖清单——扫描核心不要引入第三方库（GUI 层例外）。
 

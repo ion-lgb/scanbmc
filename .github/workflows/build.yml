@@ -1,0 +1,144 @@
+name: 打包发布 (Build & Release)
+
+# 触发方式：
+#   1. 推送 tag（v1.0.0 之类）→ 自动构建四个平台的单文件并发布到 Releases
+#   2. 手动触发 workflow_dispatch → 只构建并上传 Artifact，不发布 Release
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 创建 Release 需要
+  actions: write    # 上传/删除 Artifact 需要（私有仓库必须）
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os_name }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false   # 一个平台失败不耽误其他平台
+      matrix:
+        include:
+          - os: macos-14        # Apple Silicon
+            os_name: macos
+            arch: arm64
+          - os: macos-13        # Intel（若 GitHub 退役 macos-13，删除此行即可）
+            os_name: macos
+            arch: x86_64
+          - os: windows-latest
+            os_name: windows
+            arch: x86_64
+          - os: ubuntu-22.04    # 选较老的 LTS 构建，产物兼容更多发行版
+            os_name: linux
+            arch: x86_64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: 安装构建依赖
+        shell: bash
+        run: python3 -m pip install PySide6 'pyinstaller<7'
+
+      - name: 安装 Qt 运行依赖 (Linux)
+        shell: bash
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 \
+            libxcb-xkb1 xvfb
+
+      - name: 单元测试
+        shell: bash
+        run: python3 -m unittest discover -p 'test_*.py'
+
+      - name: 计算版本号
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER=$(python3 -c "import re; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('scanbmc.py').read()).group(1))")
+          fi
+          echo "VER=${VER}" >> "$GITHUB_ENV"
+
+      - name: 用 PyInstaller 打包单文件 (--onefile)
+        shell: bash
+        env:
+          PYINSTALLER_CONFIG_DIR: ${{ github.workspace }}/.pyinstaller_cache
+        run: |
+          # --windowed：Windows 隐藏控制台窗口；macOS 上 Finder 双击不弹终端。
+          # 注意 PyInstaller 6.x 会对 macOS 的 "onefile + windowed" 组合打弃用警告，
+          # 并在 dist/ 额外生成一个 .app——无碍，重命名步骤只取单文件；
+          # 若未来 PyInstaller 7.x 将其变为报错，再改用 onedir .app 方案。
+          python3 -m PyInstaller --noconfirm --clean --onefile --windowed \
+            --specpath build/spec --name ScanBMC scanbmc_gui.py
+          ls -lh dist/
+
+      - name: Ad-hoc 签名 (macOS)
+        shell: bash
+        if: runner.os == 'macOS'
+        run: codesign --force -s - dist/ScanBMC
+
+      - name: 冒烟测试打包产物（2 秒自动退出，验证 Qt 插件齐全）
+        shell: bash
+        run: |
+          CMD="./dist/ScanBMC"
+          [ "$RUNNER_OS" = "Windows" ] && CMD="./dist/ScanBMC.exe"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            SCANBMC_GUI_SMOKE=1 xvfb-run -a "$CMD"
+          else
+            SCANBMC_GUI_SMOKE=1 "$CMD"
+          fi
+
+      - name: 重命名产物
+        shell: bash
+        run: |
+          mkdir -p release_artifacts
+          SUFFIX=""
+          [ "$RUNNER_OS" = "Windows" ] && SUFFIX=".exe"
+          mv "dist/ScanBMC${SUFFIX}" \
+             "release_artifacts/ScanBMC-${VER}-${{ matrix.os_name }}-${{ matrix.arch }}${SUFFIX}"
+          ls -lh release_artifacts/
+
+      - name: 上传构建产物 (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScanBMC-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: release_artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 发布到 GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_artifacts/*
+          name: ScanBMC ${{ env.VER }}
+          body: |
+            ## ScanBMC ${{ env.VER }} —— 全平台单文件版
+
+            下载对应平台的单个文件即可直接运行，无需安装 Python 或任何依赖。
+
+            - **macos-arm64**：Apple Silicon（M1/M2/M3/M4）Mac
+            - **macos-x86_64**：Intel Mac
+            - **windows-x86_64**：Windows 10/11（.exe）
+            - **linux-x86_64**：Linux（需系统自带常见 Qt 运行库，见 README）
+
+            首次运行提示：
+            - macOS：右键 → 打开（或终端执行 `xattr -cr <文件>` 后双击）
+            - Windows：SmartScreen 提示时点「更多信息 → 仍要运行」（未签名应用属正常现象）
+            - Linux：缺少运行库时 `sudo apt install libxcb-cursor0 libegl1`
