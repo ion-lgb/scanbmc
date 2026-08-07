@@ -639,6 +639,22 @@ class TestFdLimit(unittest.TestCase):
         """拿不到 resource 模块（如 Windows）时不应瞎收敛。"""
         self.assertEqual(sb.cap_workers(128, 0), 128)
 
+    def test_cap_workers_custom_headroom(self):
+        """headroom 参数可覆盖默认 FD_HEADROOM（供 UDP 句柄预留场景使用）。"""
+        self.assertEqual(sb.cap_workers(256, 256, headroom=100), 156)
+        self.assertEqual(sb.cap_workers(256, 256), 256 - sb.FD_HEADROOM, "不传时行为不变")
+
+    def test_udp_fd_reserve_disabled(self):
+        self.assertEqual(sb.udp_fd_reserve(128, 254, False), 0)
+
+    def test_udp_fd_reserve_capped_by_targets(self):
+        """并发数远大于目标数时，预留量按目标数封顶，而不是按并发数。"""
+        self.assertEqual(sb.udp_fd_reserve(128, 10, True), 20)
+
+    def test_udp_fd_reserve_capped_by_workers(self):
+        """目标数远大于并发数时，预留量按并发数封顶（同时在跑的 UDP 任务数不会超过并发数）。"""
+        self.assertEqual(sb.udp_fd_reserve(128, 5000, True), 256)
+
     def test_ensure_fd_limit_raises_soft_limit(self):
         try:
             import resource

@@ -32,8 +32,9 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -413,11 +414,23 @@ def ensure_fd_limit(needed: int) -> Tuple[int, int]:
     return soft, hard
 
 
-def cap_workers(workers: int, soft_limit: int) -> int:
+def cap_workers(workers: int, soft_limit: int, headroom: int = FD_HEADROOM) -> int:
     """按句柄上限收敛并发数，至少保留 1。"""
     if soft_limit <= 0:
         return workers
-    return max(1, min(workers, soft_limit - FD_HEADROOM))
+    return max(1, min(workers, soft_limit - headroom))
+
+
+def udp_fd_reserve(workers: int, target_count: int, udp_enabled: bool) -> int:
+    """UDP 探测阶段每个目标会并发开 3 个 socket（认证能力查询/ASF Ping/
+    Get Device ID），比其余探测任务（每任务 1 个 socket）多占 2 个。
+    句柄预留必须把这部分算进去，否则 TCP 端口列表较短、UDP 任务占比
+    偏高时，实际并发句柄数会超出"并发数 + FD_HEADROOM"的预算，
+    在高并发下悄悄触发 EMFILE。
+    """
+    if not udp_enabled:
+        return 0
+    return 2 * min(workers, target_count)
 
 
 def _run(cmd: Sequence[str]) -> str:
@@ -1419,10 +1432,11 @@ def scan(
 
     pool = ThreadPoolExecutor(max_workers=cfg.workers)
     try:
-        # 分批提交，批次间检查取消标志，让 GUI 能及时停下
-        batch = max(cfg.workers, 1)
-        for start in range(0, len(tasks), batch):
-            list(pool.map(run_probe, tasks[start : start + batch]))
+        # 一次性提交全部任务：线程池自己负责"谁先完成谁先接下一个"，
+        # 不会出现按批提交时"一批里最慢的任务拖住整批空闲线程"的浪费。
+        # 每完成一个就检查取消标志，比按批检查响应更快。
+        futures = [pool.submit(run_probe, task) for task in tasks]
+        for _ in as_completed(futures):
             if cfg.cancel_event is not None and cfg.cancel_event.is_set():
                 break
     finally:
@@ -1478,9 +1492,8 @@ def scan(
         fp_workers = min(cfg.workers, 64)
         pool2 = ThreadPoolExecutor(max_workers=fp_workers)
         try:
-            batch = max(fp_workers, 1)
-            for start in range(0, len(fp_tasks), batch):
-                list(pool2.map(run_fp, fp_tasks[start : start + batch]))
+            futures2 = [pool2.submit(run_fp, task) for task in fp_tasks]
+            for _ in as_completed(futures2):
                 if cfg.cancel_event is not None and cfg.cancel_event.is_set():
                     break
         finally:
@@ -1501,16 +1514,7 @@ def scan(
 
 def _display_width(text: str) -> int:
     """粗略计算显示宽度（CJK 按 2 列算）。"""
-    width = 0
-    for ch in text:
-        width += 2 if unicodedata_east_asian(ch) else 1
-    return width
-
-
-def unicodedata_east_asian(ch: str) -> bool:
-    import unicodedata
-
-    return unicodedata.east_asian_width(ch) in ("W", "F")
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
 
 
 def _pad(text: str, width: int) -> str:
@@ -1696,11 +1700,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
-    # 每个并发探测占一个句柄。macOS 交互式 shell 默认软上限只有 256，
+    # 每个并发探测占一个句柄，UDP 探测阶段每个目标还会额外多占 2 个
+    # （见 udp_fd_reserve）。macOS 交互式 shell 默认软上限只有 256，
     # 直接用 -c 256 会撞 EMFILE，所以先尝试抬升上限，抬不动就收敛并发数。
     requested_workers = max(1, args.concurrency)
-    soft_limit, _hard = ensure_fd_limit(requested_workers + FD_HEADROOM)
-    workers = cap_workers(requested_workers, soft_limit)
+    headroom = FD_HEADROOM + udp_fd_reserve(requested_workers, len(targets), not args.no_udp)
+    soft_limit, _hard = ensure_fd_limit(requested_workers + headroom)
+    workers = cap_workers(requested_workers, soft_limit, headroom)
     if workers < requested_workers:
         log(
             f"提示：本进程文件句柄上限为 {soft_limit}，并发数已从 "
