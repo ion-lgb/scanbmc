@@ -677,11 +677,26 @@ def parse_asf_pong(data: bytes) -> Optional[dict]:
     return result
 
 
+def _bcd(value: int) -> int:
+    """把 BCD 编码字节转成十进制整数（0x26 → 26）。"""
+    return (value >> 4) * 10 + (value & 0x0F)
+
+
 def parse_device_id(data: bytes) -> Optional[dict]:
     """解析 Get Device ID（cmd 0x01）应答。
 
     该命令无需认证，大多数 BMC 即使屏蔽 auth-cap 查询也会应答，
     可拿到固件版本、IPMI 版本、厂商 ID 与产品 ID。
+
+    数据段布局（IPMI 2.0 规范，completion code 之后）：
+      [0]       Device ID
+      [1]       Device Revision（[7:4]=major / [3:0]=minor）
+      [2]       Firmware Revision 1（bit7=设备可用标志，[6:0]=次版本，BCD）
+      [3]       Firmware Revision 2（主版本，BCD）
+      [4]       IPMI Version（BCD，0x02 表示 2.0）
+      [5]       Additional Device Support
+      [6..8]    Manufacturer ID（LSB 在前）
+      [9..10]   Product ID（LSB 在前）
     """
     if len(data) < 21 or data[0] != 0x06 or data[3] != 0x07:
         return None
@@ -695,14 +710,18 @@ def parse_device_id(data: bytes) -> Optional[dict]:
     if completion != 0x00:
         return {"ipmi": True, "completion_code": completion, "note": "Get Device ID 被拒绝"}
     payload = body[7:]
-    if len(payload) < 9:
+    if len(payload) < 11:
         return {"ipmi": True, "completion_code": 0, "note": "Get Device ID 应答不完整"}
 
-    fw_major = (payload[1] >> 4) & 0x0F
-    fw_minor = payload[2]
-    ipmi_ver = payload[3]
-    manufacturer = payload[4] | (payload[5] << 8) | (payload[6] << 16)
-    product_id = payload[7] | (payload[8] << 8)
+    # 固件修订按 BCD 编码：主版本在 Firmware Rev 2，次版本在 Firmware Rev 1 的低 7 位。
+    fw_major = _bcd(payload[3])
+    fw_minor = _bcd(payload[2] & 0x7F)
+    # Firmware Rev 1 的 bit7 = 设备可用标志：0=正常可用，1=固件更新/不可用。
+    available = not bool(payload[2] & 0x80)
+
+    ipmi_ver = payload[4]
+    manufacturer = payload[6] | (payload[7] << 8) | (payload[8] << 16)
+    product_id = payload[9] | (payload[10] << 8)
 
     if ipmi_ver == 0x02:
         ver_str = "2.0"
@@ -720,7 +739,7 @@ def parse_device_id(data: bytes) -> Optional[dict]:
         "manufacturer_id": manufacturer,
         "manufacturer": IPMI_OEM_IDS.get(manufacturer, f"IANA-{manufacturer}" if manufacturer else ""),
         "product_id": product_id,
-        "available": bool(payload[9] & 0x80) if len(payload) > 9 else True,
+        "available": available,
     }
 
 

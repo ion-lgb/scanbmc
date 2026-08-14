@@ -179,13 +179,18 @@ class TestIpmiPacket(unittest.TestCase):
 
 class TestDeviceId(unittest.TestCase):
     @staticmethod
-    def _response(fw1=0x61, fw2=0x1A, ipmi_ver=0x02, oem=10876,
-                  product=0x0100, available=0x80, completion=0x00):
+    def _response(device_id=0x20, dev_rev=0x01, fw_major=0x06, fw_minor=0x26,
+                  ipmi_ver=0x02, oem=10876, product=0x0100, available=True,
+                  completion=0x00):
+        # 按 IPMI 2.0 规范布局构造：Firmware Rev 1 的 bit7=0 表示可用，
+        # [6:0] 是次版本（BCD）；主版本在 Firmware Rev 2。
+        fw1 = (fw_minor & 0x7F) | (0x00 if available else 0x80)
         payload = bytes([
-            0x20, fw1, fw2, ipmi_ver,
+            device_id, dev_rev, fw1, fw_major, ipmi_ver,
+            0x00,                                    # Additional Device Support
             oem & 0xFF, (oem >> 8) & 0xFF, (oem >> 16) & 0xFF,
             product & 0xFF, (product >> 8) & 0xFF,
-            available, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,            # 辅助固件信息（可选）
         ])
         body = bytes([0x81, 0x1C, 0x63, 0x20, 0x00, 0x01, completion]) + payload
         return b"\x06\x00\xff\x07" + b"\x00" * 9 + bytes([len(body)]) + body
@@ -215,7 +220,7 @@ class TestDeviceId(unittest.TestCase):
 
     def test_parse_firmware_zero_padded(self):
         """固件次版本要按两位补零显示（6.05 而不是 6.5）。"""
-        info = sb.parse_device_id(self._response(fw2=0x05))
+        info = sb.parse_device_id(self._response(fw_minor=0x05))
         self.assertEqual(info["firmware"], "6.05")
 
     def test_parse_ipmi_v15(self):
@@ -228,7 +233,7 @@ class TestDeviceId(unittest.TestCase):
 
     def test_parse_not_available(self):
         """bit7=0 表示设备处于固件更新/不可用状态。"""
-        info = sb.parse_device_id(self._response(available=0x00))
+        info = sb.parse_device_id(self._response(available=False))
         self.assertFalse(info["available"])
 
     def test_nonzero_completion_still_ipmi(self):

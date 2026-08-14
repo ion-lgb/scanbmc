@@ -36,17 +36,22 @@ def make_ipmi_response(oem: int = 10876) -> bytes:
 
 
 def make_device_id_response(oem: int = 10876) -> bytes:
-    """构造 Get Device ID 应答：Supermicro、固件 6.26、IPMI 2.0、产品 ID 0x0100。"""
+    """构造 Get Device ID 应答：Supermicro、固件 6.26、IPMI 2.0、产品 ID 0x0100。
+
+    按 IPMI 2.0 规范布局：Firmware Rev 1 的 bit7=0（可用）+ 次版本 0x26（BCD），
+    主版本 0x06（BCD）在 Firmware Rev 2；厂商 ID 与产品 ID 均为 LSB 在前。
+    """
     payload = bytes(
         [
             0x20,                                   # Device ID
-            0x61,                                   # 设备修订 1 + 固件修订主版本 6
-            0x1A,                                   # 固件修订次版本 26 → 6.26
-            0x02,                                   # IPMI 版本 2.0
+            0x01,                                   # Device Revision
+            0x26,                                   # Firmware Rev 1: bit7=0 可用，次版本 26
+            0x06,                                   # Firmware Rev 2: 主版本 6
+            0x02,                                   # IPMI Version 2.0
+            0x00,                                   # Additional Device Support
             oem & 0xFF, (oem >> 8) & 0xFF, (oem >> 16) & 0xFF,
-            0x00, 0x01,                             # 产品 ID 0x0100 (256)
-            0x80,                                   # 设备可用
-            0x00, 0x00,                             # 附加信息
+            0x00, 0x01,                             # Product ID 0x0100（LSB 在前）
+            0x00, 0x00, 0x00, 0x00, 0x00,           # 辅助固件信息（可选）
         ]
     )
     body = bytes([0x81, 0x1C, 0x63, 0x20, 0x00, 0x01, 0x00]) + payload
