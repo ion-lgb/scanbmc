@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.1"
 
 # --------------------------------------------------------------------------- #
 # 常量定义
