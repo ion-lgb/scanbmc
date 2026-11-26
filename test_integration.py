@@ -259,6 +259,7 @@ class TestEndToEnd(unittest.TestCase):
         """无人应答时 UDP 探测应按 retries 次数重发（IPMI + ASF 各 2 次）。"""
         dead = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         dead.bind(("127.0.0.1", 0))
+        dead.settimeout(1.0)
         dead_port = dead.getsockname()[1]
         saved = sb.IPMI_UDP_PORT
         sb.IPMI_UDP_PORT = dead_port

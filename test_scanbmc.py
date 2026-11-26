@@ -52,6 +52,53 @@ en9: flags=8802<BROADCAST,SIMPLEX,MULTICAST> mtu 1500
         nets = [str(n) for n in sb.parse_ip_addr(self.IP_ADDR)]
         self.assertEqual(nets, ["10.0.0.0/24", "172.31.0.0/16"])
 
+    IPCONFIG_MIXED = """
+Windows IP Configuration
+
+Ethernet adapter Ethernet:
+
+   Connection-specific DNS Suffix  . :
+   Link-local IPv6 Address . . . . . : fe80::1%5
+   IPv4 Address. . . . . . . . . . . : 192.168.1.23(Preferred)
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Default Gateway . . . . . . . . . : 192.168.1.1
+
+以太网适配器 以太网 2:
+
+   连接特定的 DNS 后缀 . . . . . . . :
+   IPv4 地址 . . . . . . . . . . . . : 10.20.0.7(首选)
+   子网掩码  . . . . . . . . . . . . : 255.255.252.0
+   默认网关. . . . . . . . . . . . . : 10.20.0.1
+
+无线局域网适配器 WLAN:
+
+   媒体状态  . . . . . . . . . . . . : 媒体已断开连接
+"""
+
+    ARP_WINDOWS = """
+接口: 192.168.1.23 --- 0x5
+  Internet 地址         物理地址              类型
+  192.168.1.1           aa-bb-cc-dd-ee-ff     动态
+  192.168.1.50          11-22-33-44-55-66     动态
+  224.0.0.22            01-00-5e-00-00-16     静态
+  255.255.255.255       ff-ff-ff-ff-ff-ff     静态
+
+Interface: 10.20.0.7 --- 0x9
+  Internet Address      Physical Address      Type
+  10.20.0.1             de-ad-be-ef-00-01     dynamic
+"""
+
+    def test_ipconfig_english_and_chinese(self):
+        nets = [str(n) for n in sb.parse_ipconfig(self.IPCONFIG_MIXED)]
+        self.assertEqual(nets, ["192.168.1.0/24", "10.20.0.0/22"])
+
+    def test_parse_arp_output_windows(self):
+        ips = sb.parse_arp_output(self.ARP_WINDOWS)
+        self.assertEqual(ips, ["192.168.1.1", "192.168.1.50", "10.20.0.1"])
+        self.assertNotIn("192.168.1.23", ips, "不应把本机接口头 IP 当作邻居")
+        self.assertNotIn("224.0.0.22", ips, "不应包含多播地址")
+        self.assertNotIn("255.255.255.255", ips, "不应包含广播地址")
+
 
 class TestTargets(unittest.TestCase):
     def test_cidr_excludes_network_and_broadcast(self):
@@ -224,15 +271,18 @@ class TestDeviceId(unittest.TestCase):
         self.assertEqual(info["firmware"], "6.05")
 
     def test_parse_ipmi_v15(self):
-        info = sb.parse_device_id(self._response(ipmi_ver=0x15))
+        """IPMI 2.0 规范 Table 20-2：0x51 表示 1.5（低 4 位主版本，高 4 位次版本）。"""
+        info = sb.parse_device_id(self._response(ipmi_ver=0x51))
         self.assertEqual(info["ipmi_version"], "1.5")
+        info_empty = sb.parse_device_id(self._response(ipmi_ver=0x00))
+        self.assertEqual(info_empty["ipmi_version"], "")
 
     def test_parse_unknown_oem(self):
         info = sb.parse_device_id(self._response(oem=99999))
         self.assertEqual(info["manufacturer"], "IANA-99999")
 
     def test_parse_not_available(self):
-        """bit7=0 表示设备处于固件更新/不可用状态。"""
+        """bit7=1 表示设备处于固件更新/不可用状态。"""
         info = sb.parse_device_id(self._response(available=False))
         self.assertFalse(info["available"])
 
@@ -660,6 +710,23 @@ class TestFdLimit(unittest.TestCase):
         """目标数远大于并发数时，预留量按并发数封顶（同时在跑的 UDP 任务数不会超过并发数）。"""
         self.assertEqual(sb.udp_fd_reserve(128, 5000, True), 256)
 
+    def test_resolve_workers_low_limit_with_udp(self):
+        """软上限 256 且开启 UDP 时，并发数应收敛到 69 而不是被错误压到 1。"""
+        w = sb.resolve_workers(256, 254, True, 256)
+        self.assertEqual(w, 69)
+        self.assertLessEqual(w + sb.FD_HEADROOM + sb.udp_fd_reserve(w, 254, True), 256)
+
+    def test_resolve_workers_few_targets_with_udp(self):
+        """目标数很少时，UDP 额外占用按目标数封顶，剩余句柄可分给 TCP 并发。"""
+        w = sb.resolve_workers(256, 10, True, 256)
+        self.assertEqual(w, 188)
+        self.assertLessEqual(w + sb.FD_HEADROOM + sb.udp_fd_reserve(w, 10, True), 256)
+
+    def test_resolve_workers_no_udp_and_unknown_limit(self):
+        self.assertEqual(sb.resolve_workers(256, 254, False, 256), 256 - sb.FD_HEADROOM)
+        self.assertEqual(sb.resolve_workers(256, 254, True, 0), 256)
+        self.assertEqual(sb.resolve_workers(256, 254, True, 8), 1)
+
     def test_ensure_fd_limit_raises_soft_limit(self):
         try:
             import resource
@@ -742,6 +809,36 @@ class TestProbeStats(unittest.TestCase):
         stats.add_oserror(OSError(_errno.EMFILE, "too many open files"))
         self.assertEqual(stats.systemic_failures, 1)
 
+    def test_wsaemfile_is_systemic(self):
+        import errno as _errno
+
+        code = getattr(_errno, "WSAEMFILE", None)
+        if code is None:
+            self.skipTest("当前平台无 WSAEMFILE")
+        stats = sb.ProbeStats()
+        stats.add_oserror(OSError(code, "too many open sockets"))
+        self.assertEqual(stats.systemic_failures, 1)
+
+    def test_udp_send_records_systemic_error(self):
+        """UDP sendto 遇到 ENETDOWN 应计入系统性故障；ConnectionRefused 不应计入。"""
+        import errno as _errno
+        from unittest import mock
+
+        stats = sb.ProbeStats()
+        fake = mock.MagicMock()
+        fake.sendto.side_effect = OSError(_errno.ENETDOWN, "network is down")
+        with mock.patch.object(sb.socket, "socket", return_value=fake):
+            res = sb._udp_send("10.0.0.1", sb.ASF_PRESENCE_PING, 0.2, 0, sb.parse_asf_pong, stats)
+        self.assertIsNone(res)
+        self.assertEqual(stats.systemic_failures, 1)
+
+        stats2 = sb.ProbeStats()
+        fake2 = mock.MagicMock()
+        fake2.sendto.side_effect = ConnectionRefusedError("icmp port unreachable")
+        with mock.patch.object(sb.socket, "socket", return_value=fake2):
+            sb._udp_send("10.0.0.1", sb.ASF_PRESENCE_PING, 0.2, 0, sb.parse_asf_pong, stats2)
+        self.assertEqual(stats2.systemic_failures, 0)
+
     def test_thread_safety(self):
         import threading as _threading
 
@@ -778,9 +875,14 @@ class TestRender(unittest.TestCase):
         import json
         host = self._sample()[0]
         host.web = [{"port": 443, "scheme": "https", "_haystack": "秘密内部字段"}]
+        host.redfish = {"port": 443, "status": 200, "_haystack": "内部 redfish"}
         doc = json.loads(sb.render_json([host], show_all=False, meta={"targets": 1}))
         self.assertNotIn("_haystack", doc["results"][0]["web"][0])
+        self.assertNotIn("_haystack", doc["results"][0]["redfish"])
         self.assertEqual(doc["results"][0]["ip"], "192.168.1.50")
+        # 确认不原地破坏调用方持有的 HostResult 对象
+        self.assertIn("_haystack", host.web[0])
+        self.assertIn("_haystack", host.redfish)
 
     def test_csv_header(self):
         out = sb.render_csv(self._sample(), show_all=False)

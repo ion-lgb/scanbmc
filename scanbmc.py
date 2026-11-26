@@ -36,7 +36,7 @@ import unicodedata
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 __version__ = "1.1.1"
@@ -196,6 +196,10 @@ SYSTEMIC_ERRNOS = {
     errno.EACCES,
     errno.EPERM,
 }
+# Windows 上 Winsock 句柄耗尽抛出 WSAEMFILE(10024)，与 POSIX EMFILE(24) 不同
+_wsa_emfile = getattr(errno, "WSAEMFILE", None)
+if _wsa_emfile is not None:
+    SYSTEMIC_ERRNOS.add(_wsa_emfile)
 
 # 单机不可达：局域网里 ARP 解析不到该地址时会立刻返回这类错误。
 # 对"扫一整个网段、其中大部分地址本来就空着"来说，这是完全正常的结果，
@@ -290,6 +294,17 @@ class HostResult:
         return ",".join(items)
 
     def to_dict(self) -> dict:
+        redfish_clean = (
+            {k: v for k, v in self.redfish.items() if not k.startswith("_")}
+            if isinstance(self.redfish, dict)
+            else self.redfish
+        )
+        web_clean = [
+            {k: v for k, v in w.items() if not k.startswith("_")}
+            if isinstance(w, dict)
+            else w
+            for w in self.web
+        ]
         return {
             "ip": self.ip,
             "confidence": self.confidence,
@@ -298,9 +313,9 @@ class HostResult:
             "ipmi": self.ipmi,
             "asf_pong": self.asf_pong,
             "device_id": self.device_id,
-            "redfish": self.redfish,
-            "web": self.web,
-            "evidence": self.evidence,
+            "redfish": redfish_clean,
+            "web": web_clean,
+            "evidence": list(self.evidence),
             "ports": [
                 {"port": p.port, "proto": p.proto, "service": p.service, "banner": p.banner}
                 for p in sorted(self.ports, key=lambda x: x.port)
@@ -371,6 +386,37 @@ def parse_ip_addr(output: str) -> List[ipaddress.IPv4Network]:
     return nets
 
 
+def parse_ipconfig(output: str) -> List[ipaddress.IPv4Network]:
+    """解析 Windows `ipconfig` 输出（兼容中英文）。"""
+    nets: List[ipaddress.IPv4Network] = []
+    pending_ip: Optional[str] = None
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        # 非缩进行为适配器标题，重置上一张网卡的挂起 IP
+        if not line[0].isspace():
+            pending_ip = None
+            continue
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        key_l = key.lower()
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)", val)
+        if not m:
+            continue
+        if "ipv4" in key_l or "ip address" in key_l or "ip 地址" in key_l:
+            pending_ip = m.group(1)
+        elif pending_ip and ("subnet mask" in key_l or "子网掩码" in key_l):
+            prefix = _netmask_to_prefix(m.group(1))
+            if prefix is not None:
+                try:
+                    nets.append(ipaddress.ip_network(f"{pending_ip}/{prefix}", strict=False))
+                except ValueError:
+                    pass
+            pending_ip = None
+    return nets
+
+
 def primary_ipv4() -> Optional[str]:
     """通过一个不发包的 UDP connect 拿到出口网卡 IP。"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -433,6 +479,32 @@ def udp_fd_reserve(workers: int, target_count: int, udp_enabled: bool) -> int:
     return 2 * min(workers, target_count)
 
 
+def resolve_workers(
+    requested: int,
+    target_count: int,
+    udp_enabled: bool,
+    soft_limit: int,
+    headroom: int = FD_HEADROOM,
+) -> int:
+    """在句柄软上限内求解最大安全并发数。
+
+    需满足 w + headroom + udp_fd_reserve(w, target_count, udp_enabled) <= soft_limit。
+    若直接用未收敛的 requested 计算固定预留量再从 soft_limit 扣除，在软上限偏低时
+    会把并发数错误压到 1（例如 requested=256、targets=254、soft_limit=256 时）。
+    """
+    requested = max(1, requested)
+    if soft_limit <= 0:
+        return requested
+    avail = soft_limit - headroom
+    if avail <= 0:
+        return 1
+    if not udp_enabled:
+        return max(1, min(requested, avail))
+    # w <= target_count 时：3*w <= avail；w > target_count 时：w + 2*target_count <= avail
+    max_w = max(avail // 3, avail - 2 * target_count)
+    return max(1, min(requested, max_w))
+
+
 def _run(cmd: Sequence[str]) -> str:
     exe = shutil.which(cmd[0])
     if not exe:
@@ -450,13 +522,18 @@ def detect_local_networks() -> List[ipaddress.IPv4Network]:
     """自动检测本机所在的 IPv4 网段（已去重、去回环/链路本地）。"""
     nets: List[ipaddress.IPv4Network] = []
 
-    out = _run(["ip", "-o", "-4", "addr", "show"])
-    if out:
-        nets.extend(parse_ip_addr(out))
-    if not nets:
-        out = _run(["ifconfig", "-a"])
+    if sys.platform == "win32":
+        out = _run(["ipconfig"])
         if out:
-            nets.extend(parse_ifconfig(out))
+            nets.extend(parse_ipconfig(out))
+    else:
+        out = _run(["ip", "-o", "-4", "addr", "show"])
+        if out:
+            nets.extend(parse_ip_addr(out))
+        if not nets:
+            out = _run(["ifconfig", "-a"])
+            if out:
+                nets.extend(parse_ifconfig(out))
 
     if not nets:
         ip = primary_ipv4()
@@ -472,14 +549,32 @@ def detect_local_networks() -> List[ipaddress.IPv4Network]:
     return result
 
 
+def parse_arp_output(output: str) -> List[str]:
+    """从 `arp` / `ip neigh` 输出中提取邻居 IPv4 地址（跳过 Windows 接口头行与多播/广播）。"""
+    seen: List[str] = []
+    for line in output.splitlines():
+        stripped = line.lstrip()
+        if stripped.lower().startswith("interface:") or stripped.startswith("接口:"):
+            continue
+        for token in re.findall(r"\b(\d+\.\d+\.\d+\.\d+)\b", line):
+            try:
+                addr = ipaddress.IPv4Address(token)
+            except ValueError:
+                continue
+            if addr.is_multicast or token == "255.255.255.255":
+                continue
+            if token not in seen:
+                seen.append(token)
+    return seen
+
+
 def arp_neighbors() -> List[str]:
     """读取本机 ARP/邻居表中的 IPv4 地址（用于 --arp-only 快速模式）。"""
-    out = _run(["arp", "-a", "-n"]) or _run(["arp", "-an"]) or _run(["ip", "neigh", "show"])
-    seen: List[str] = []
-    for ip in re.findall(r"\b(\d+\.\d+\.\d+\.\d+)\b", out):
-        if ip not in seen:
-            seen.append(ip)
-    return seen
+    if sys.platform == "win32":
+        out = _run(["arp", "-a"])
+    else:
+        out = _run(["arp", "-a", "-n"]) or _run(["arp", "-an"]) or _run(["ip", "neigh", "show"])
+    return parse_arp_output(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -693,7 +788,7 @@ def parse_device_id(data: bytes) -> Optional[dict]:
       [1]       Device Revision（[7:4]=major / [3:0]=minor）
       [2]       Firmware Revision 1（bit7=设备可用标志，[6:0]=次版本，BCD）
       [3]       Firmware Revision 2（主版本，BCD）
-      [4]       IPMI Version（BCD，0x02 表示 2.0）
+      [4]       IPMI Version（BCD，低 4 位主版本/高 4 位次版本，0x51=1.5，0x02=2.0）
       [5]       Additional Device Support
       [6..8]    Manufacturer ID（LSB 在前）
       [9..10]   Product ID（LSB 在前）
@@ -723,12 +818,11 @@ def parse_device_id(data: bytes) -> Optional[dict]:
     manufacturer = payload[6] | (payload[7] << 8) | (payload[8] << 16)
     product_id = payload[9] | (payload[10] << 8)
 
-    if ipmi_ver == 0x02:
-        ver_str = "2.0"
-    elif ipmi_ver == 0x00:
+    # IPMI 2.0 规范 Table 20-2：低 4 位为主版本，高 4 位为次版本（0x51=1.5，0x02=2.0）
+    if ipmi_ver == 0x00:
         ver_str = ""
     else:
-        ver_str = f"{ipmi_ver >> 4}.{ipmi_ver & 0x0F}"
+        ver_str = f"{ipmi_ver & 0x0F}.{ipmi_ver >> 4}"
 
     return {
         "ipmi": True,
@@ -794,8 +888,11 @@ def _udp_send(ip: str, packet: bytes, timeout: float, retries: int, parser,
                     return parsed
         except (socket.timeout, TimeoutError):
             pass
-        except OSError:
-            # ICMP port unreachable 会在部分平台上以 ConnectionRefused/ECONNRESET 抛出
+        except OSError as exc:
+            # ICMP port unreachable 会在部分平台上以 ConnectionRefused/ECONNRESET 抛出，
+            # 属于正常关闭；但本机侧系统性故障（如 ENETDOWN/ENETUNREACH）或主机不可达需记账。
+            if stats and (exc.errno in SYSTEMIC_ERRNOS or exc.errno in HOST_DOWN_ERRNOS):
+                stats.add_oserror(exc)
             return None
         finally:
             sock.close()
@@ -945,7 +1042,8 @@ def _parse_x509_der(der: bytes) -> Optional[dict]:
 
 def _cert_summary(not_after: datetime, subject_cn: str, issuer: str) -> dict:
     """把证书关键字段整理成展示用的摘要，并计算剩余天数。"""
-    days_left = (not_after - datetime.utcnow()).days
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    days_left = (not_after - now_utc).days
     return {
         "subject_cn": subject_cn,
         "issuer": issuer,
@@ -993,13 +1091,41 @@ def _cert_info_der(der: bytes) -> Optional[dict]:
     return _cert_summary(parsed["not_after"], parsed["subject_cn"], parsed["issuer"])
 
 
+_TLS_CTX: Optional[ssl.SSLContext] = None
+_TLS_CTX_LOCK = threading.Lock()
+
+
+def _get_tls_context() -> ssl.SSLContext:
+    """返回可复用的宽松 TLS 客户端上下文（线程安全，避免每次请求重复初始化）。"""
+    global _TLS_CTX
+    if _TLS_CTX is None:
+        with _TLS_CTX_LOCK:
+            if _TLS_CTX is None:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                # BMC 上大量老设备只支持旧协议/弱套件，放宽以便识别
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    try:
+                        ctx.minimum_version = ssl.TLSVersion.TLSv1
+                    except (AttributeError, ValueError):
+                        pass
+                try:
+                    ctx.set_ciphers("ALL:@SECLEVEL=0")
+                except ssl.SSLError:
+                    pass
+                _TLS_CTX = ctx
+    return _TLS_CTX
+
+
 def _http_request(ip: str, port: int, tls: bool, path: str, timeout: float) -> Optional[dict]:
     """发一个最小化的 HTTP GET，返回状态行 / 头 / 部分正文。"""
     host = f"[{ip}]" if ":" in ip else ip
     request = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
-        "User-Agent: scanbmc/1.0\r\n"
+        f"User-Agent: scanbmc/{__version__}\r\n"
         "Accept: */*\r\n"
         "Accept-Encoding: gzip, deflate\r\n"
         "Connection: close\r\n\r\n"
@@ -1013,20 +1139,7 @@ def _http_request(ip: str, port: int, tls: bool, path: str, timeout: float) -> O
     try:
         sock.connect((ip, port))
         if tls:
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            # BMC 上大量老设备只支持旧协议/弱套件，放宽以便识别
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                try:
-                    ctx.minimum_version = ssl.TLSVersion.TLSv1
-                except (AttributeError, ValueError):
-                    pass
-            try:
-                ctx.set_ciphers("ALL:@SECLEVEL=0")
-            except ssl.SSLError:
-                pass
+            ctx = _get_tls_context()
             sock = ctx.wrap_socket(sock, server_hostname=None, do_handshake_on_connect=True)
         cert = None
         if tls:
@@ -1073,7 +1186,9 @@ def _http_request(ip: str, port: int, tls: bool, path: str, timeout: float) -> O
     for line in lines[1:]:
         key, sep, value = line.decode("latin-1", "replace").partition(":")
         if sep:
-            headers[key.strip().lower()] = value.strip()
+            k = key.strip().lower()
+            v = value.strip()
+            headers[k] = f"{headers[k]}; {v}" if k in headers else v
 
     status = 0
     m = re.match(r"HTTP/\d\.\d\s+(\d{3})", status_line)
@@ -1411,10 +1526,14 @@ def scan(
     hosts: Dict[str, HostResult] = {ip: HostResult(ip=ip) for ip in targets}
 
     # ---- 阶段一：端口发现 ----
+    # 将每台主机的 3 个 UDP/623 探测直接作为独立任务放入主线程池，
+    # 避免为每台主机反复创建/销毁嵌套线程池，也保证每个 worker 最多只占 1 个 socket。
     tasks: List[Tuple[str, str, int]] = []
     for ip in targets:
         if cfg.udp:
-            tasks.append(("udp", ip, IPMI_UDP_PORT))
+            tasks.append(("udp_ipmi", ip, IPMI_UDP_PORT))
+            tasks.append(("udp_asf", ip, IPMI_UDP_PORT))
+            tasks.append(("udp_devid", ip, IPMI_UDP_PORT))
         for port in cfg.tcp_ports:
             tasks.append(("tcp", ip, port))
 
@@ -1429,12 +1548,30 @@ def scan(
             return
         kind, ip, port = task
         try:
-            if kind == "udp":
-                ipmi, pong, devid = udp_probe(ip, cfg.timeout, cfg.retries, stats=stats)
-                with lock:
-                    hosts[ip].ipmi = ipmi
-                    hosts[ip].asf_pong = pong
-                    hosts[ip].device_id = devid
+            if kind == "udp_ipmi":
+                ipmi = _udp_send(
+                    ip, IPMI_GET_CHANNEL_AUTH_CAP, cfg.timeout, cfg.retries,
+                    parse_ipmi_response, stats,
+                )
+                if ipmi is not None:
+                    with lock:
+                        hosts[ip].ipmi = ipmi
+            elif kind == "udp_asf":
+                pong = _udp_send(
+                    ip, ASF_PRESENCE_PING, cfg.timeout, cfg.retries,
+                    parse_asf_pong, stats,
+                )
+                if pong is not None:
+                    with lock:
+                        hosts[ip].asf_pong = True
+            elif kind == "udp_devid":
+                devid = _udp_send(
+                    ip, IPMI_GET_DEVICE_ID, cfg.timeout, cfg.retries,
+                    parse_device_id, stats,
+                )
+                if devid is not None:
+                    with lock:
+                        hosts[ip].device_id = devid
             else:
                 res = tcp_probe(ip, port, cfg.timeout, cfg.retries, stats=stats)
                 if res:
@@ -1447,7 +1584,8 @@ def scan(
             if stats:
                 stats.add(f"bug:{type(exc).__name__}")
         finally:
-            progress.step()
+            if cfg.cancel_event is None or not cfg.cancel_event.is_set():
+                progress.step()
 
     pool = ThreadPoolExecutor(max_workers=cfg.workers)
     try:
@@ -1506,7 +1644,8 @@ def scan(
                 if stats:
                     stats.add(f"bug:{type(exc).__name__}")
             finally:
-                progress2.step()
+                if cfg.cancel_event is None or not cfg.cancel_event.is_set():
+                    progress2.step()
 
         fp_workers = min(cfg.workers, 64)
         pool2 = ThreadPoolExecutor(max_workers=fp_workers)
@@ -1519,7 +1658,22 @@ def scan(
             _shutdown_pool(pool2)
         progress2.finish()
 
-    results = [h for h in hosts.values() if h.is_alive]
+    # 加锁做结果快照：取消扫描时后台残留线程可能仍在向 hosts 写入，
+    # 快照后 classify 与返回结果完全隔离，避免并发读写竞争。
+    with lock:
+        results = [
+            HostResult(
+                ip=h.ip,
+                ports=list(h.ports),
+                ipmi=h.ipmi,
+                asf_pong=h.asf_pong,
+                device_id=h.device_id,
+                redfish=h.redfish,
+                web=list(h.web),
+            )
+            for h in hosts.values()
+            if h.is_alive
+        ]
     for host in results:
         classify(host)
     results.sort(key=lambda h: (-CONF_ORDER[h.confidence], int(ipaddress.IPv4Address(h.ip))))
@@ -1567,11 +1721,6 @@ def render_table(results: List[HostResult], show_all: bool, verbose: bool) -> st
 
 def render_json(results: List[HostResult], show_all: bool, meta: dict) -> str:
     rows = [r.to_dict() for r in results if show_all or r.is_bmc]
-    for row in rows:
-        for w in row.get("web", []):
-            w.pop("_haystack", None)
-        if row.get("redfish"):
-            row["redfish"].pop("_haystack", None)
     return json.dumps({"meta": meta, "results": rows}, ensure_ascii=False, indent=2)
 
 
@@ -1723,9 +1872,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # （见 udp_fd_reserve）。macOS 交互式 shell 默认软上限只有 256，
     # 直接用 -c 256 会撞 EMFILE，所以先尝试抬升上限，抬不动就收敛并发数。
     requested_workers = max(1, args.concurrency)
-    headroom = FD_HEADROOM + udp_fd_reserve(requested_workers, len(targets), not args.no_udp)
-    soft_limit, _hard = ensure_fd_limit(requested_workers + headroom)
-    workers = cap_workers(requested_workers, soft_limit, headroom)
+    needed_fds = requested_workers + FD_HEADROOM + udp_fd_reserve(
+        requested_workers, len(targets), not args.no_udp
+    )
+    soft_limit, _hard = ensure_fd_limit(needed_fds)
+    workers = resolve_workers(requested_workers, len(targets), not args.no_udp, soft_limit)
     if workers < requested_workers:
         log(
             f"提示：本进程文件句柄上限为 {soft_limit}，并发数已从 "

@@ -307,9 +307,11 @@ class ScanWorker(QThread):
         # 每个并发探测占一个句柄，UDP 探测阶段每个目标还会额外多占 2 个
         # （见 core.udp_fd_reserve）：先尝试抬升，抬不动就收敛并发数
         requested = max(1, self.workers)
-        headroom = core.FD_HEADROOM + core.udp_fd_reserve(requested, len(targets), self.udp)
-        soft, _ = core.ensure_fd_limit(requested + headroom)
-        workers = core.cap_workers(requested, soft, headroom)
+        needed_fds = requested + core.FD_HEADROOM + core.udp_fd_reserve(
+            requested, len(targets), self.udp
+        )
+        soft, _ = core.ensure_fd_limit(needed_fds)
+        workers = core.resolve_workers(requested, len(targets), self.udp, soft)
         if workers < requested:
             self.notice.emit(
                 f"本进程文件句柄上限为 {soft}，并发数已从 {requested} 收敛到 {workers}。"
@@ -613,6 +615,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_scan)
         self.clear_btn.clicked.connect(self.clear_results)
         self.export_btn.clicked.connect(self.export_results)
+        self.all_cb.toggled.connect(self._on_show_all_toggled)
 
         self._set_empty_text(scanning=False)
         self._show_results(False)
@@ -747,8 +750,22 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self._last_results = []
         self._last_meta = {}
+        self._displayed_rows = []
+        self.summary_label.setText("")
         self._show_results(False)
         self._set_empty_text(scanning=False)
+
+    def _on_show_all_toggled(self, _checked: bool) -> None:
+        """勾选/取消「显示所有存活主机」时，若已有缓存结果则立即刷新表格。"""
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if not self._last_results:
+            return
+        self._populate_table(self._last_results)
+        rows_shown = self.table.rowCount()
+        self._show_results(rows_shown > 0)
+        if rows_shown == 0:
+            self._set_empty_text(scanning=False, found_none=True)
 
     def export_results(self) -> None:
         if not self._last_results:
@@ -803,6 +820,8 @@ class MainWindow(QMainWindow):
     # ---------- 信号槽 ----------
 
     def on_progress(self, done: int, total: int, phase: str) -> None:
+        if self.worker is None or self.worker.cancel_event.is_set():
+            return
         name = "端口发现" if phase == "probe" else "指纹识别"
         self.progress_bar.setMaximum(max(total, 1))
         self.progress_bar.setValue(done)
@@ -890,12 +909,17 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _preferred_url(host: HostResult) -> str:
-        """按开放端口猜测管理页协议：优先 HTTPS（BMC 常用自签证书），其次 HTTP。"""
+        """按开放端口猜测管理页协议与端口：优先 HTTPS，其次 HTTP，非默认端口附带端口号。"""
         ports = {p.port for p in host.ports}
-        if 443 in ports or 5989 in ports:
+        if 443 in ports:
             return f"https://{host.ip}/"
-        if 80 in ports or 5985 in ports or 5988 in ports:
+        if 5989 in ports:
+            return f"https://{host.ip}:5989/"
+        if 80 in ports:
             return f"http://{host.ip}/"
+        for port in (5985, 5988):
+            if port in ports:
+                return f"http://{host.ip}:{port}/"
         return f"https://{host.ip}/"
 
     def on_cell_clicked(self, row: int, column: int) -> None:
