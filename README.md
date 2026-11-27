@@ -1,41 +1,150 @@
+<div align="center">
+
 # ScanBMC
 
-Windows 原生局域网服务器 BMC（基板管理控制器）扫描器，基于 **C# (.NET 8 + WPF)** 实现，零第三方运行库依赖、无需管理员权限，只做只读探测（不登录、不爆破）。
+**Native Windows LAN Baseboard Management Controller (BMC) Discovery & Audit Tool**
 
-支持识别 Dell iDRAC、HPE iLO、Supermicro / AMI MegaRAC、华为 iBMC、联想 XClarity、Cisco IMC、Fujitsu iRMC、浪潮、H3C HDM、OpenBMC 等常见 BMC。
+[![Build Status](https://img.shields.io/github/actions/workflow/status/ion-lgb/scanbmc/build.yml?branch=main&style=flat-square&label=build)](https://github.com/ion-lgb/scanbmc/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/ion-lgb/scanbmc?style=flat-square)](https://github.com/ion-lgb/scanbmc/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D4?style=flat-square)](https://github.com/ion-lgb/scanbmc/releases)
+[![.NET](https://img.shields.io/badge/.NET-8.0%20WPF-512BD4?style=flat-square)](https://dotnet.microsoft.com/download/dotnet/8.0)
+[![License](https://img.shields.io/github/license/ion-lgb/scanbmc?style=flat-square)](LICENSE)
 
-## 特性
+**English** | [简体中文](README.zh-CN.md)
 
-- **真实协议验证**：UDP/623 IPMI RMCP（`Get Channel Authentication Capabilities` + 免认证 `Get Device ID`）、ASF Presence Pong、`/redfish/v1/` JSON、Web 指纹（支持 chunked + gzip/deflate 解压）。
-- **运维安全告警**：自动标出 IPMI 匿名登录 / 空用户名弱配置，以及 HTTPS 证书已过期或 30 天内到期（`⚠`）。
-- **原生 Windows 体验**：
-  - 顶部单行紧凑工具栏 + 可折叠高级参数面板
-  - 原生 `DataGrid` 支持任意列排序、实时搜索筛选、「仅告警」过滤、右键菜单（打开 HTTPS/HTTP 管理页、复制 IP/完整诊断）
-  - 底部可拖拽「设备详情」面板完整展示所有协议细节与证书信息，不再被截断
-  - 一键导出 JSON / CSV（CSV 带 UTF-8 BOM，Excel 双击直开不乱码）
+</div>
 
-## 开发与构建
+---
 
-需要 [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)：
+## Overview
+
+**ScanBMC** is a lightweight, read-only LAN discovery and security-hygiene utility built with **C# (.NET 8 + WPF)** for Windows system administrators and data center engineers.
+
+Unlike generic port scanners that guess device types from open TCP ports, ScanBMC validates each host with **real management protocols** (IPMI RMCP, Get Device ID, ASF Presence Ping, Redfish, and decompressed HTTP/HTTPS fingerprinting) so ordinary web servers are never misclassified as BMCs.
+
+> **Strictly Read-Only**: ScanBMC never attempts authentication, never sends credentials, and never performs brute-force checks.
+
+---
+
+## Key Features
+
+- **Protocol-Verified Discovery**: Sends real UDP/623 IPMI `Get Channel Authentication Capabilities`, unauthenticated `Get Device ID` (aligned with IPMI 2.0 Table 20-2), ASF Presence Ping, and `/redfish/v1/` probes.
+- **High-Accuracy Vendor Identification**:
+  - Recognizes **Dell iDRAC**, **HPE iLO**, **Supermicro / ATEN**, **AMI MegaRAC**, **Huawei iBMC**, **Lenovo XClarity / IBM IMM**, **Cisco IMC**, **Fujitsu iRMC**, **Inspur**, **H3C HDM**, **ASRock Rack**, **Gigabyte**, **Tyan**, and **OpenBMC**.
+  - Filters Redfish placeholder fields (`N/A`, `Redfish Server`, `To Be Filled By O.E.M.`) and falls back to `Server` header & OEM keys.
+  - Handles truncated `chunked` + `gzip` / `deflate` HTTP responses (common on embedded `lighttpd` BMCs).
+- **Operational & Security Auditing**:
+  - Flags weak IPMI channel configurations (**anonymous login** / **null usernames enabled**).
+  - Extracts peer X.509 certificates over HTTPS and flags **expired** or **expiring within 30 days** TLS certificates.
+  - Detects system-level local network failures (disconnected NIC / no route / socket exhaustion) separately from normal empty LAN addresses.
+- **Native Windows Desktop Workflow**:
+  - High-concurrency asynchronous engine (`async/await` + `SemaphoreSlim` + `CancellationToken`).
+  - Automatic local subnet discovery via native .NET `NetworkInterface` APIs, plus ARP neighbor fast mode.
+  - Real-time search, segmented filtering (`BMC` / `Alerts` / `All Alive`), column sorting, structured device inspector, browser launch, and one-click **CSV (UTF-8 BOM)** / **JSON** export.
+
+---
+
+## Detection Methodology
+
+Evidence is weighted from strongest to weakest; only verified management protocol responses produce a **Confirmed** classification:
+
+| Probe / Evidence | Confidence | Details |
+| :--- | :---: | :--- |
+| UDP/623 IPMI RMCP (`Get Channel Auth Cap`) | **Confirmed** | Extracts IPMI 1.5/2.0 support, authentication types, IANA OEM ID, and anonymous/null-user flags |
+| UDP/623 IPMI (`Get Device ID`) | **Confirmed** | Unauthenticated fallback when auth-cap is blocked; retrieves firmware revision, IPMI version, manufacturer, and product ID |
+| UDP/623 ASF Presence Pong | **Confirmed** | Fallback for BMCs that block IPMI commands while still answering ASF Ping |
+| `/redfish/v1/` JSON response | **Confirmed** | HTTP `200`, `401`, or `403` with JSON payload confirms a Redfish service root |
+| HTTP(S) Web Fingerprint | **Likely** | Matches `Server` header, HTML `<title>`, `WWW-Authenticate` realm, cookies, and decompressed response body |
+| Management Port Combination | **Possible** | Weak heuristic (`623/tcp`, `5900` iKVM + Web, or CIM/WBEM / iLO console ports) |
+
+**Default Probed Ports**: TCP `80, 443, 623, 5900, 5985, 5988, 5989, 17990` + UDP `623`.
+
+---
+
+## Download & Usage
+
+Download the latest Windows binary from [GitHub Releases](https://github.com/ion-lgb/scanbmc/releases):
+
+- **`ScanBMC-<version>-windows-x64.exe`** — Self-contained single-file executable for Windows 10/11 (x64). No .NET runtime or external dependencies required.
+
+### Quick Start
+
+1. Launch `ScanBMC.exe`.
+2. Leave **Target** empty to auto-detect active local IPv4 subnets, or enter CIDR / IP ranges (e.g., `192.168.1.0/24`, `10.0.0.1-100`).
+3. Click **Start Scan** (or press `Enter`).
+4. Select any discovered device to inspect full protocol details, firmware info, and TLS certificate expiration; double-click a row to open its management console in your browser.
+
+> **Note on Unsigned Binaries**: Release binaries are not commercially code-signed. Windows SmartScreen may display an "Unknown publisher" prompt on first run (click **More info → Run anyway**). On Windows 11 systems with **Smart App Control** enabled, unsigned executables may be blocked by OS policy; you can build from source locally instead.
+
+---
+
+## Build from Source
+
+### Prerequisites
+
+- Windows 10 or Windows 11 (x64)
+- [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
+
+### Commands
 
 ```powershell
-# 运行测试
-dotnet test ScanBMC.sln
+# Run unit and loopback integration tests
+dotnet test ScanBMC.sln -c Release
 
-# 启动调试
+# Run the WPF desktop application
 dotnet run --project src/ScanBMC.App
 
-# 发布单文件 exe（依赖系统 .NET 8 桌面运行时，仅数百 KB）
-dotnet publish src/ScanBMC.App/ScanBMC.App.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish/fdd
+# Publish a self-contained single-file executable
+dotnet publish src/ScanBMC.App/ScanBMC.App.csproj `
+  -c Release -r win-x64 --self-contained true `
+  -p:PublishSingleFile=true `
+  -p:IncludeNativeLibrariesForSelfExtract=true `
+  -p:EnableCompressionInSingleFile=true `
+  -p:DebugType=none `
+  -o publish/win-x64
 
-# 发布独立单文件 exe（开箱即用，无需目标机器装 .NET）
-dotnet publish src/ScanBMC.App/ScanBMC.App.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o publish/self-contained
+# Publish a framework-dependent lightweight executable (~280 KB, requires .NET 8 Desktop Runtime)
+dotnet publish src/ScanBMC.App/ScanBMC.App.csproj `
+  -c Release -r win-x64 --self-contained false `
+  -p:PublishSingleFile=true `
+  -p:DebugType=none `
+  -o publish/win-x64-lite
 ```
 
-## 代码签名政策
+---
 
-本项目拟通过 [SignPath.io](https://signpath.io/) 与 [SignPath Foundation](https://signpath.org/) 为开源发布产物提供免费代码签名，详见 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)。本程序仅执行用户主动触发的局域网只读探测，不收集或上传任何遥测与用户数据。
+## Project Structure
 
-## 许可证
+```text
+ScanBMC.sln
+├── src/
+│   ├── ScanBMC.Core/              # Zero-dependency .NET 8 scanning engine
+│   │   ├── Models.cs              # Domain models, ScanConfig, ProbeStats
+│   │   ├── NetworkDiscovery.cs    # Native NetworkInterface subnet detection, CIDR/range/ARP parsers
+│   │   ├── IpmiProtocol.cs        # IPMI RMCP, Get Device ID (Table 20-2), ASF Ping/Pong
+│   │   ├── HttpProbe.cs           # Async Socket/SslStream HTTP(S), gzip/chunked decoding, X.509 extraction
+│   │   ├── Classifier.cs          # Weighted evidence classification & alert rules
+│   │   ├── Scanner.cs             # Async two-phase concurrent scanner
+│   │   └── Exporters.cs           # JSON and Excel-friendly CSV exporters
+│   └── ScanBMC.App/               # Native Windows WPF Fluent UI
+│       ├── Assets/                # Multi-resolution application icon
+│       ├── Themes/FluentTheme.xaml
+│       ├── MainWindow.xaml(.cs)
+│       └── App.xaml(.cs)
+└── tests/
+    └── ScanBMC.Core.Tests/        # xUnit protocol unit tests & loopback Fake BMC integration tests
+```
 
-本项目以 MIT 许可证开源，详见 [LICENSE](LICENSE)。
+---
+
+## Security & Responsible Use
+
+- Use ScanBMC **only on networks you own or are explicitly authorized to audit**.
+- ScanBMC performs read-only network discovery probes and collects no telemetry.
+- Found an unrecognized BMC vendor or OEM ID? Contributions and fingerprint reports are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+## License
+
+Licensed under the [MIT License](LICENSE).

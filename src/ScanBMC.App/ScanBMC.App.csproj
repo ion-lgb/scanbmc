@@ -10,8 +10,13 @@
     <AssemblyName>ScanBMC</AssemblyName>
     <RootNamespace>ScanBMC.App</RootNamespace>
     <Product>ScanBMC</Product>
-    <Description>局域网服务器 BMC 扫描器 (Windows 原生版)</Description>
+    <Description>Read-only LAN BMC discovery tool for Windows</Description>
+    <ApplicationIcon>Assets\scanbmc.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\scanbmc.ico" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\ScanBMC.Core\ScanBMC.Core.csproj" />

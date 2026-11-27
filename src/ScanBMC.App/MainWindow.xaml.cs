@@ -5,6 +5,7 @@ using System.Net;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using Microsoft.Win32;
@@ -12,34 +13,61 @@ using ScanBMC.Core;
 
 namespace ScanBMC.App;
 
+public sealed class EvidenceItem
+{
+    public string Text { get; init; } = "";
+    public Brush Bg { get; init; } = Brushes.Transparent;
+    public Brush Border { get; init; } = Brushes.Transparent;
+    public Thickness BorderThickness { get; init; } = new(0);
+    public Brush Fg { get; init; } = Brushes.Black;
+    public Brush Dot { get; init; } = Brushes.Gray;
+}
+
 public sealed class HostRow
 {
     public HostResult Raw { get; }
     public string Ip => Raw.Ip;
     public uint IpSortKey { get; }
     public int ConfidenceRank => ScanConstants.ConfidenceRank(Raw.Confidence);
-    public string ConfidenceDisplay => string.IsNullOrEmpty(Raw.Confidence) ? "—" : Raw.Confidence;
+    public string ConfidenceDisplay => string.IsNullOrEmpty(Raw.Confidence) ? "存活" : Raw.Confidence;
     public string VendorDisplay => string.IsNullOrEmpty(Raw.Vendor) ? "—" : Raw.Vendor;
     public string OpenPorts { get; }
-    public bool HasWarnings => Raw.HasWarnings;
-    public string WarningSummary { get; }
-    public string EvidenceSummary { get; }
+    public string CompactPorts { get; }
+    public int WarningCount => Raw.Warnings.Count;
+    public Visibility WarningVisibility => Raw.HasWarnings ? Visibility.Visible : Visibility.Collapsed;
+    public string WarningShort { get; }
+    public string ProtocolSummary { get; }
 
     public Brush ConfidenceBg { get; }
     public Brush ConfidenceFg { get; }
     public Brush ConfidenceBorder { get; }
 
-    private static readonly Brush ConfirmedBg = Freeze(new SolidColorBrush(Color.FromRgb(0xE6, 0xF4, 0xEA)));
-    private static readonly Brush ConfirmedFg = Freeze(new SolidColorBrush(Color.FromRgb(0x13, 0x73, 0x33)));
-    private static readonly Brush ConfirmedBd = Freeze(new SolidColorBrush(Color.FromRgb(0xB7, 0xDF, 0xC1)));
+    public Brush WarningBg { get; }
+    public Brush WarningFg { get; }
+    public Brush WarningBorder { get; }
 
-    private static readonly Brush LikelyBg = Freeze(new SolidColorBrush(Color.FromRgb(0xE8, 0xF0, 0xFE)));
-    private static readonly Brush LikelyFg = Freeze(new SolidColorBrush(Color.FromRgb(0x17, 0x4E, 0xA6)));
-    private static readonly Brush LikelyBd = Freeze(new SolidColorBrush(Color.FromRgb(0xAE, 0xCB, 0xFA)));
+    private static readonly Brush ConfirmedBg = Freeze(new SolidColorBrush(Color.FromRgb(0xDF, 0xF6, 0xDD)));
+    private static readonly Brush ConfirmedFg = Freeze(new SolidColorBrush(Color.FromRgb(0x10, 0x7C, 0x10)));
+    private static readonly Brush ConfirmedBd = Freeze(new SolidColorBrush(Color.FromRgb(0xBC, 0xE8, 0xB7)));
 
-    private static readonly Brush PossibleBg = Freeze(new SolidColorBrush(Color.FromRgb(0xF1, 0xF3, 0xF4)));
-    private static readonly Brush PossibleFg = Freeze(new SolidColorBrush(Color.FromRgb(0x44, 0x47, 0x46)));
-    private static readonly Brush PossibleBd = Freeze(new SolidColorBrush(Color.FromRgb(0xDA, 0xDC, 0xE0)));
+    private static readonly Brush LikelyBg = Freeze(new SolidColorBrush(Color.FromRgb(0xE8, 0xF2, 0xFC)));
+    private static readonly Brush LikelyFg = Freeze(new SolidColorBrush(Color.FromRgb(0x00, 0x5A, 0x9E)));
+    private static readonly Brush LikelyBd = Freeze(new SolidColorBrush(Color.FromRgb(0xB8, 0xD7, 0xF5)));
+
+    private static readonly Brush NeutralBg = Freeze(new SolidColorBrush(Color.FromRgb(0xF3, 0xF3, 0xF3)));
+    private static readonly Brush NeutralFg = Freeze(new SolidColorBrush(Color.FromRgb(0x5E, 0x5E, 0x5E)));
+    private static readonly Brush NeutralBd = Freeze(new SolidColorBrush(Color.FromRgb(0xE0, 0xE0, 0xE0)));
+
+    private static readonly Brush WarnAmberBg = Freeze(new SolidColorBrush(Color.FromRgb(0xFF, 0xF4, 0xCE)));
+    private static readonly Brush WarnAmberFg = Freeze(new SolidColorBrush(Color.FromRgb(0x8A, 0x53, 0x00)));
+    private static readonly Brush WarnAmberBd = Freeze(new SolidColorBrush(Color.FromRgb(0xF0, 0xD2, 0x8B)));
+
+    private static readonly Brush WarnRedBg = Freeze(new SolidColorBrush(Color.FromRgb(0xFD, 0xE7, 0xE9)));
+    private static readonly Brush WarnRedFg = Freeze(new SolidColorBrush(Color.FromRgb(0xA4, 0x26, 0x2C)));
+    private static readonly Brush WarnRedBd = Freeze(new SolidColorBrush(Color.FromRgb(0xF1, 0xB8, 0xBE)));
+
+    private static readonly Brush NormalFg = Freeze(new SolidColorBrush(Color.FromRgb(0x2B, 0x2B, 0x2B)));
+    private static readonly Brush NormalDot = Freeze(new SolidColorBrush(Color.FromRgb(0x00, 0x67, 0xC0)));
 
     private static Brush Freeze(SolidColorBrush b) { b.Freeze(); return b; }
 
@@ -48,19 +76,122 @@ public sealed class HostRow
         Raw = raw;
         IpSortKey = NetworkDiscovery.IpToUInt(IPAddress.Parse(raw.Ip));
         OpenPorts = raw.OpenPortsString();
-        WarningSummary = string.Join("；", raw.Warnings);
-        EvidenceSummary = string.Join("；", raw.Evidence.Where(e => !e.StartsWith("⚠", StringComparison.Ordinal)));
+        CompactPorts = BuildCompactPorts(raw);
+
+        var warns = raw.Warnings;
+        if (warns.Count > 0)
+        {
+            string first = warns[0].TrimStart('⚠', ' ');
+            WarningShort = warns.Count > 1 ? $"{first} (+{warns.Count - 1})" : first;
+            bool severe = warns.Any(w => w.Contains("已过期") || w.Contains("匿名登录"));
+            (WarningBg, WarningFg, WarningBorder) = severe
+                ? (WarnRedBg, WarnRedFg, WarnRedBd)
+                : (WarnAmberBg, WarnAmberFg, WarnAmberBd);
+        }
+        else
+        {
+            WarningShort = "";
+            (WarningBg, WarningFg, WarningBorder) = (Brushes.Transparent, Brushes.Transparent, Brushes.Transparent);
+        }
+
+        ProtocolSummary = BuildProtocolSummary(raw);
 
         (ConfidenceBg, ConfidenceFg, ConfidenceBorder) = raw.Confidence switch
         {
             ScanConstants.ConfConfirmed => (ConfirmedBg, ConfirmedFg, ConfirmedBd),
             ScanConstants.ConfLikely => (LikelyBg, LikelyFg, LikelyBd),
-            ScanConstants.ConfPossible => (PossibleBg, PossibleFg, PossibleBd),
-            _ => (Brushes.Transparent, PossibleFg, Brushes.Transparent),
+            _ => (NeutralBg, NeutralFg, NeutralBd),
         };
     }
 
-    public string FormatOverview()
+    private static string BuildCompactPorts(HostResult r)
+    {
+        var list = new List<string>();
+        if (r.Ipmi is not null || r.AsfPong || r.DeviceId is not null)
+            list.Add("623/udp");
+        list.AddRange(r.Ports.OrderBy(p => p.Port).Select(p => p.Port.ToString()));
+        return list.Count > 0 ? string.Join(", ", list) : "—";
+    }
+
+    private static string BuildProtocolSummary(HostResult r)
+    {
+        var parts = new List<string>();
+        if (r.Ipmi is { } ipmi)
+        {
+            string v = ipmi.Versions.Count > 0 ? $"v{string.Join("/", ipmi.Versions)}" : "";
+            parts.Add($"IPMI {v}".Trim());
+        }
+        else if (r.AsfPong)
+        {
+            parts.Add("ASF Pong");
+        }
+
+        if (r.DeviceId is { CompletionCode: 0 } dev && !string.IsNullOrEmpty(dev.Firmware))
+            parts.Add($"FW {dev.Firmware}");
+
+        if (r.Redfish is { } rf)
+            parts.Add(string.IsNullOrEmpty(rf.Version) ? $"Redfish ({rf.Status})" : $"Redfish {rf.Version}");
+
+        CertInfo? cert = r.Redfish?.Cert ?? r.Web.FirstOrDefault(w => w.Cert is not null)?.Cert;
+        if (cert is not null && !cert.Expired)
+            parts.Add($"TLS 至 {cert.NotAfter}");
+
+        if (parts.Count == 0)
+        {
+            var nonWarn = r.Evidence.Where(e => !e.StartsWith("⚠", StringComparison.Ordinal)).Take(2);
+            return string.Join(" · ", nonWarn);
+        }
+        return string.Join("  ·  ", parts);
+    }
+
+    public List<EvidenceItem> BuildEvidenceItems()
+    {
+        var items = new List<EvidenceItem>();
+        // 告警条目置顶显示，其余按原序排列
+        var ordered = Raw.Evidence
+            .OrderByDescending(e => e.StartsWith("⚠", StringComparison.Ordinal))
+            .ToList();
+
+        if (ordered.Count == 0)
+        {
+            items.Add(new EvidenceItem
+            {
+                Text = "无 BMC 特征证据（普通局域网存活主机）",
+                Fg = NeutralFg,
+                Dot = NeutralFg,
+            });
+            return items;
+        }
+
+        foreach (var ev in ordered)
+        {
+            if (ev.StartsWith("⚠", StringComparison.Ordinal))
+            {
+                bool severe = ev.Contains("已过期") || ev.Contains("匿名登录");
+                items.Add(new EvidenceItem
+                {
+                    Text = ev.TrimStart('⚠', ' '),
+                    Bg = severe ? WarnRedBg : WarnAmberBg,
+                    Border = severe ? WarnRedBd : WarnAmberBd,
+                    BorderThickness = new Thickness(1),
+                    Fg = severe ? WarnRedFg : WarnAmberFg,
+                    Dot = severe ? WarnRedFg : WarnAmberFg,
+                });
+            }
+            else
+            {
+                items.Add(new EvidenceItem
+                {
+                    Text = ev,
+                    Fg = NormalFg,
+                    Dot = NormalDot,
+                });
+            }
+        }
+        return items;
+    }
+
+    public string FormatFullReport()
     {
         var sb = new StringBuilder();
         sb.AppendLine($"IP 地址  : {Raw.Ip}");
@@ -68,40 +199,10 @@ public sealed class HostRow
         sb.AppendLine($"设备类型 : {VendorDisplay}");
         sb.AppendLine($"开放端口 : {(string.IsNullOrEmpty(OpenPorts) ? "-" : OpenPorts)}");
         sb.AppendLine($"管理地址 : {Raw.PreferredUrl()}");
-        return sb.ToString().TrimEnd();
-    }
-
-    public string FormatFullDetails()
-    {
-        var sb = new StringBuilder();
-        if (Raw.Evidence.Count > 0)
-        {
-            foreach (var ev in Raw.Evidence)
-                sb.AppendLine($"• {ev}");
-        }
-        else
-        {
-            sb.AppendLine("• 无 BMC 特征证据（普通存活主机）");
-        }
-
-        if (Raw.Ipmi is { CompletionCode: 0 } ipmi)
-        {
-            sb.AppendLine();
-            sb.AppendLine($"[IPMI] 通道={ipmi.Channel}  版本={string.Join("/", ipmi.Versions)}  认证方式={string.Join(",", ipmi.AuthTypes)}");
-        }
-        if (Raw.DeviceId is { CompletionCode: 0 } dev)
-        {
-            sb.AppendLine($"[Device ID] 固件={dev.Firmware}  IPMI={dev.IpmiVersion}  厂商ID={dev.ManufacturerId}  产品ID=0x{dev.ProductId:X4}  状态={(dev.Available ? "正常" : "更新/不可用")}");
-        }
-        if (Raw.Redfish is { } rf)
-        {
-            sb.AppendLine($"[Redfish] HTTP {rf.Status}  版本={rf.Version}  Server={rf.Server}  Vendor={rf.Vendor}  Product={rf.Product}");
-        }
-        CertInfo? cert = Raw.Redfish?.Cert ?? Raw.Web.FirstOrDefault(w => w.Cert is not null)?.Cert;
-        if (cert is not null)
-        {
-            sb.AppendLine($"[TLS 证书] CN={cert.SubjectCn}  颁发者={cert.Issuer}  到期={cert.NotAfter}（剩余 {cert.DaysLeft} 天）");
-        }
+        sb.AppendLine();
+        sb.AppendLine("判定依据:");
+        foreach (var ev in Raw.Evidence)
+            sb.AppendLine($"  - {ev}");
         return sb.ToString().TrimEnd();
     }
 }
@@ -122,7 +223,6 @@ public partial class MainWindow : Window
         PortsBox.Text = string.Join(",", ScanConstants.DefaultTcpPorts.Keys.OrderBy(p => p));
         ResultsGrid.ItemsSource = _visibleRows;
 
-        // 冒烟测试钩子：SCANBMC_GUI_SMOKE=1 时 2 秒自动退出
         if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SCANBMC_GUI_SMOKE")))
         {
             var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
@@ -131,11 +231,33 @@ public partial class MainWindow : Window
         }
     }
 
+    private void DetectNetBtn_Click(object sender, RoutedEventArgs e)
+    {
+        var nets = NetworkDiscovery.DetectLocalNetworks();
+        if (nets.Count == 0)
+        {
+            StatusText.Text = "未检测到活动 IPv4 网段，请手动输入目标。";
+            return;
+        }
+        TargetsBox.Text = string.Join(", ", nets.Select(n => n.ToString()));
+        StatusText.Text = $"已检测到 {nets.Count} 个本机网段：{TargetsBox.Text}";
+    }
+
     private void AdvancedToggle_Changed(object sender, RoutedEventArgs e)
     {
         bool open = AdvancedToggle.IsChecked == true;
         AdvancedPanel.Visibility = open ? Visibility.Visible : Visibility.Collapsed;
-        AdvancedToggle.Content = open ? "高级参数 ▴" : "高级参数 ▾";
+        AdvancedToggleText.Text = open ? "选项 ▴" : "选项 ▾";
+    }
+
+    private void ExportMenuBtn_Click(object sender, RoutedEventArgs e)
+    {
+        if (ExportMenuBtn.ContextMenu is { } menu)
+        {
+            menu.PlacementTarget = ExportMenuBtn;
+            menu.Placement = PlacementMode.Bottom;
+            menu.IsOpen = true;
+        }
     }
 
     private void TargetsBox_KeyDown(object sender, KeyEventArgs e)
@@ -166,7 +288,7 @@ public partial class MainWindow : Window
                 var nets = NetworkDiscovery.DetectLocalNetworks();
                 if (nets.Count == 0)
                 {
-                    MessageBox.Show(this, "无法自动检测本机活动网段，请在「目标」栏手动输入（如 192.168.1.0/24）。", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    MessageBox.Show(this, "无法自动检测本机活动网段，请在「扫描目标」手动输入（如 192.168.1.0/24）。", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
                     return;
                 }
                 usedSpecs = nets.Select(n => n.ToString()).ToList();
@@ -181,7 +303,7 @@ public partial class MainWindow : Window
                 var neighbors = NetworkDiscovery.FilterToSpecs(NetworkDiscovery.GetArpNeighbors(), usedSpecs);
                 if (neighbors.Count == 0)
                 {
-                    MessageBox.Show(this, "ARP 表中没有落在目标范围内的地址，请取消「ARP 快速模式」或更换目标网段。", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    MessageBox.Show(this, "ARP 表中没有落在目标范围内的地址，请取消「仅扫描 ARP 邻居」或更换目标网段。", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
                     return;
                 }
                 targets = NetworkDiscovery.BuildTargets(neighbors, excludes);
@@ -234,9 +356,13 @@ public partial class MainWindow : Window
         SetBusy(true);
         _allResults.Clear();
         _visibleRows.Clear();
-        ClearDetailPane();
+        ClearInspector();
+        UpdateSegmentCounts();
+        EmptyTitle.Text = "正在扫描…";
+        EmptySubtitle.Text = $"目标网段：{string.Join(", ", usedSpecs)}（共 {targets.Count} 个地址）";
+        EmptyOverlay.Visibility = Visibility.Visible;
         SummaryText.Text = "";
-        StatusText.Text = $"正在扫描 {string.Join(", ", usedSpecs)}（共 {targets.Count} 个目标）...";
+        StatusText.Text = $"正在扫描 {string.Join(", ", usedSpecs)}（{targets.Count} 个地址）…";
         ScanProgressBar.Visibility = Visibility.Visible;
         ScanProgressBar.Value = 0;
 
@@ -274,18 +400,14 @@ public partial class MainWindow : Window
                 degraded = stats.IsDegraded,
             };
 
+            UpdateSegmentCounts();
             RefreshFilteredRows();
 
-            if (_cts.IsCancellationRequested)
-            {
-                StatusText.Text = $"已停止，展示已发现的 {alive} 台存活主机（BMC {bmc} 台）";
-            }
-            else
-            {
-                StatusText.Text = $"完成：扫描 {targets.Count} 个地址，耗时 {sw.Elapsed.TotalSeconds:F1}s";
-            }
+            StatusText.Text = _cts.IsCancellationRequested
+                ? $"已停止（耗时 {sw.Elapsed.TotalSeconds:F1}s）"
+                : $"扫描完成：{string.Join(", ", usedSpecs)}，耗时 {sw.Elapsed.TotalSeconds:F1}s";
 
-            SummaryText.Text = $"存活 {alive}  |  BMC {bmc}  |  告警 {warned}";
+            SummaryText.Text = $"目标 {targets.Count}   ·   存活 {alive}   ·   BMC {bmc}   ·   告警 {warned}";
 
             if (stats.IsDegraded && !_cts.IsCancellationRequested)
             {
@@ -315,7 +437,7 @@ public partial class MainWindow : Window
     {
         if (_cts is not null && !_cts.IsCancellationRequested)
         {
-            StatusText.Text = "正在停止...";
+            StatusText.Text = "正在停止…";
             _cts.Cancel();
         }
     }
@@ -326,22 +448,44 @@ public partial class MainWindow : Window
         StartBtn.IsEnabled = !busy;
         StopBtn.IsEnabled = busy;
         TargetsBox.IsEnabled = !busy;
+        DetectNetBtn.IsEnabled = !busy;
         AdvancedPanel.IsEnabled = !busy;
     }
 
-    private void FilterChanged(object sender, RoutedEventArgs e) => RefreshFilteredRows();
+    private void UpdateSegmentCounts()
+    {
+        if (_allResults.Count == 0)
+        {
+            ModeBmcRadio.Content = "BMC";
+            ModeWarnRadio.Content = "告警";
+            ModeAllRadio.Content = "全部存活";
+            return;
+        }
+        int bmc = _allResults.Count(r => r.IsBmc);
+        int warn = _allResults.Count(r => r.IsBmc && r.HasWarnings);
+        int alive = _allResults.Count;
+        ModeBmcRadio.Content = $"BMC ({bmc})";
+        ModeWarnRadio.Content = $"告警 ({warn})";
+        ModeAllRadio.Content = $"全部 ({alive})";
+    }
+
+    private void FilterChanged(object sender, RoutedEventArgs e)
+    {
+        if (!IsLoaded) return;
+        RefreshFilteredRows();
+    }
 
     private void RefreshFilteredRows()
     {
         string kw = FilterBox.Text.Trim();
-        bool showAll = ShowAllCheck.IsChecked == true;
-        bool warnOnly = WarnOnlyCheck.IsChecked == true;
+        bool modeAll = ModeAllRadio.IsChecked == true;
+        bool modeWarn = ModeWarnRadio.IsChecked == true;
 
         _visibleRows.Clear();
         foreach (var host in _allResults)
         {
-            if (!showAll && !host.IsBmc) continue;
-            if (warnOnly && !host.HasWarnings) continue;
+            if (!modeAll && !host.IsBmc) continue;
+            if (modeWarn && !host.HasWarnings) continue;
             if (!string.IsNullOrEmpty(kw))
             {
                 bool match = host.Ip.Contains(kw, StringComparison.OrdinalIgnoreCase)
@@ -353,32 +497,116 @@ public partial class MainWindow : Window
             _visibleRows.Add(new HostRow(host));
         }
 
-        if (_visibleRows.Count > 0 && ResultsGrid.SelectedItem is null)
-            ResultsGrid.SelectedIndex = 0;
-        else if (_visibleRows.Count == 0)
-            ClearDetailPane();
+        if (_visibleRows.Count > 0)
+        {
+            EmptyOverlay.Visibility = Visibility.Collapsed;
+            if (ResultsGrid.SelectedItem is null)
+                ResultsGrid.SelectedIndex = 0;
+        }
+        else
+        {
+            ClearInspector();
+            if (!_isScanning)
+            {
+                EmptyTitle.Text = _allResults.Count == 0 ? "未发现存活设备" : "无匹配筛选条件的设备";
+                EmptySubtitle.Text = _allResults.Count == 0
+                    ? "请确认目标网段可达，或适当增大超时时间后重试"
+                    : "尝试清空搜索词或切换上方视图过滤选项";
+                EmptyOverlay.Visibility = Visibility.Visible;
+            }
+        }
     }
 
     private void ResultsGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (ResultsGrid.SelectedItem is HostRow row)
+        if (ResultsGrid.SelectedItem is not HostRow row)
         {
-            DetailOverviewBox.Text = row.FormatOverview();
-            DetailEvidenceBox.Text = row.FormatFullDetails();
-            OpenBrowserBtn.IsEnabled = true;
-            CopyIpBtn.IsEnabled = true;
-            CopyDetailBtn.IsEnabled = true;
+            ClearInspector();
+            return;
+        }
+
+        var r = row.Raw;
+        InspectorTitle.Text = r.Ip;
+        InspectorVendor.Text = $"{row.VendorDisplay}  ·  {row.ConfidenceDisplay}";
+
+        PropUrlText.Text = r.PreferredUrl();
+        PropPortsText.Text = string.IsNullOrEmpty(row.OpenPorts) ? "—" : row.OpenPorts;
+
+        if (r.Ipmi is { CompletionCode: 0 } ipmi)
+        {
+            string ver = ipmi.Versions.Count > 0 ? $"v{string.Join("/", ipmi.Versions)}" : "IPMI";
+            string auth = ipmi.AuthTypes.Count > 0 ? $"  ({string.Join(", ", ipmi.AuthTypes)})" : "";
+            PropIpmiText.Text = $"{ver} · 通道 {ipmi.Channel}{auth}";
+        }
+        else if (r.AsfPong)
+        {
+            PropIpmiText.Text = "仅响应 ASF Presence Pong";
         }
         else
         {
-            ClearDetailPane();
+            PropIpmiText.Text = "—";
         }
+
+        if (r.DeviceId is { CompletionCode: 0 } dev)
+        {
+            string prod = dev.ProductId != 0 ? $"  ·  产品 0x{dev.ProductId:X4}" : "";
+            string state = dev.Available ? "" : "  [更新/不可用]";
+            PropFirmwareText.Text = $"FW {dev.Firmware}  ·  IPMI {dev.IpmiVersion}{prod}{state}";
+        }
+        else
+        {
+            PropFirmwareText.Text = "—";
+        }
+
+        if (r.Redfish is { } rf)
+        {
+            var sb = new StringBuilder($"HTTP {rf.Status}");
+            if (!string.IsNullOrEmpty(rf.Version)) sb.Append($" · v{rf.Version}");
+            if (!string.IsNullOrEmpty(rf.Product)) sb.Append($" · {rf.Product}");
+            PropRedfishText.Text = sb.ToString();
+        }
+        else
+        {
+            PropRedfishText.Text = "—";
+        }
+
+        CertInfo? cert = r.Redfish?.Cert ?? r.Web.FirstOrDefault(w => w.Cert is not null)?.Cert;
+        if (cert is not null)
+        {
+            string cn = string.IsNullOrEmpty(cert.SubjectCn) ? "-" : cert.SubjectCn;
+            PropCertText.Text = cert.Expired
+                ? $"已过期 ({cert.NotAfter}) · CN={cn}"
+                : $"有效期至 {cert.NotAfter}（剩余 {cert.DaysLeft} 天）· CN={cn}";
+            PropCertText.Foreground = cert.Expired
+                ? new SolidColorBrush(Color.FromRgb(0xA4, 0x26, 0x2C))
+                : cert.DaysLeft <= 30
+                    ? new SolidColorBrush(Color.FromRgb(0x8A, 0x53, 0x00))
+                    : (Brush)FindResource("TextPrimaryBrush");
+        }
+        else
+        {
+            PropCertText.Text = "—";
+            PropCertText.Foreground = (Brush)FindResource("TextPrimaryBrush");
+        }
+
+        EvidenceList.ItemsSource = row.BuildEvidenceItems();
+        OpenBrowserBtn.IsEnabled = true;
+        CopyIpBtn.IsEnabled = true;
+        CopyDetailBtn.IsEnabled = true;
     }
 
-    private void ClearDetailPane()
+    private void ClearInspector()
     {
-        DetailOverviewBox.Text = "选中上方列表中的任意设备查看完整协议与证书详情（双击可直接打开管理页）。";
-        DetailEvidenceBox.Text = "";
+        InspectorTitle.Text = "设备详情";
+        InspectorVendor.Text = "";
+        PropUrlText.Text = "—";
+        PropPortsText.Text = "—";
+        PropIpmiText.Text = "—";
+        PropFirmwareText.Text = "—";
+        PropRedfishText.Text = "—";
+        PropCertText.Text = "—";
+        PropCertText.Foreground = (Brush)FindResource("TextPrimaryBrush");
+        EvidenceList.ItemsSource = null;
         OpenBrowserBtn.IsEnabled = false;
         CopyIpBtn.IsEnabled = false;
         CopyDetailBtn.IsEnabled = false;
@@ -421,8 +649,8 @@ public partial class MainWindow : Window
     {
         if (ResultsGrid.SelectedItem is HostRow row)
         {
-            Clipboard.SetText($"{row.FormatOverview()}\r\n\r\n{row.FormatFullDetails()}");
-            StatusText.Text = $"已复制 {row.Ip} 的完整诊断信息";
+            Clipboard.SetText(row.FormatFullReport());
+            StatusText.Text = $"已复制 {row.Ip} 的完整设备报告";
         }
     }
 
@@ -450,7 +678,8 @@ public partial class MainWindow : Window
         if (dlg.ShowDialog(this) != true) return;
         try
         {
-            File.WriteAllText(dlg.FileName, Exporters.ToJson(_allResults, ShowAllCheck.IsChecked == true, _lastMeta), Encoding.UTF8);
+            bool showAll = ModeAllRadio.IsChecked == true;
+            File.WriteAllText(dlg.FileName, Exporters.ToJson(_allResults, showAll, _lastMeta), Encoding.UTF8);
             StatusText.Text = $"已导出 JSON：{dlg.FileName}";
         }
         catch (Exception ex)
@@ -470,8 +699,8 @@ public partial class MainWindow : Window
         if (dlg.ShowDialog(this) != true) return;
         try
         {
-            // 带 UTF-8 BOM 方便 Excel 直接双击打开不乱码
-            File.WriteAllText(dlg.FileName, Exporters.ToCsv(_allResults, ShowAllCheck.IsChecked == true), new UTF8Encoding(true));
+            bool showAll = ModeAllRadio.IsChecked == true;
+            File.WriteAllText(dlg.FileName, Exporters.ToCsv(_allResults, showAll), new UTF8Encoding(true));
             StatusText.Text = $"已导出 CSV：{dlg.FileName}";
         }
         catch (Exception ex)

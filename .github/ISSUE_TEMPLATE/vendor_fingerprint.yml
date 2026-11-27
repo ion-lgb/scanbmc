@@ -1,0 +1,23 @@
+name: New BMC Vendor Fingerprint / OEM ID
+description: Submit an unrecognized BMC model, IPMI OEM ID, or Redfish/Web signature
+labels: ["enhancement", "fingerprint"]
+body:
+  - type: input
+    id: hardware
+    attributes:
+      label: Server / BMC Model & Firmware
+      placeholder: "e.g., Supermicro X12DPi-N6 / BMC FW 01.02.03"
+    validations:
+      required: true
+  - type: input
+    id: oem_id
+    attributes:
+      label: IPMI OEM ID / Manufacturer ID (if shown)
+      placeholder: "e.g., IANA-10876 or 21317"
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redfish / HTTP Headers & Evidence
+      description: Paste sanitized evidence from ScanBMC's Device Inspector (remove private IPs if needed).
+    validations:
+      required: true

@@ -1,0 +1,34 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in ScanBMC
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Clear description of the issue and expected behavior.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ScanBMC Version
+      placeholder: "e.g., v2.0.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows Version
+      placeholder: "e.g., Windows 11 23H2 x64"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Enter target ...
+        2. Click Start Scan ...
+    validations:
+      required: true
