@@ -40,7 +40,7 @@
 - **Windows 原生桌面体验**：
   - 纯异步高并发扫描引擎（`async/await` + `SemaphoreSlim` + `CancellationToken`），停止响应迅速。
   - 通过 .NET 原生 `NetworkInterface` API 精准获取本机活动网段与真实子网掩码，同时支持 ARP 邻居快速扫描模式。
-  - 现代 Windows 11 Fluent 界面：支持关键词实时筛选、分段视图切换（`BMC` / `告警` / `全部存活`）、任意列排序、底部结构化设备详情检查器、双击打开管理页、右键菜单与一键导出 **CSV（带 UTF-8 BOM，Excel 直开不乱码）** / **JSON**。
+  - 现代 Windows 11 Fluent 界面：支持关键词实时筛选、分段视图切换（`BMC` / `告警` / `全部存活`）、任意列排序、底部结构化设备详情检查器、双击打开管理页、右键菜单与按当前视图一键导出 **CSV（带 UTF-8 BOM 与 Excel 公式注入防护，直开不乱码）** / **JSON**。
 
 ---
 
@@ -53,7 +53,7 @@
 | UDP/623 IPMI RMCP（`Get Channel Auth Cap`） | **确认** | 解析 IPMI 1.5/2.0 支持、认证方式、IANA OEM ID 及匿名/空用户名标志 |
 | UDP/623 IPMI（`Get Device ID`） | **确认** | 免认证兜底探测，可获取固件版本、IPMI 版本、厂商与产品 ID |
 | UDP/623 ASF Presence Pong | **确认** | 针对屏蔽 IPMI 命令但仍响应 ASF Ping 的 BMC 设备 |
-| `/redfish/v1/` JSON 应答 | **确认** | 返回 HTTP `200` / `401` / `403` 且响应为 JSON 即确认存在 Redfish 服务根 |
+| `/redfish/v1/` JSON 应答 | **确认** | 返回 HTTP `200` / `401` / `403` 的 JSON 响应且命中 Redfish/OData 协议特征（`RedfishVersion`、`@odata.*`、`OData-Version` 等）即确认存在 Redfish 服务根 |
 | HTTP(S) Web 指纹 | **可能** | 匹配 `Server` 头、`<title>`、认证 realm、Cookie 与解压后的正文特征 |
 | 管理端口组合 | **疑似** | 弱特征启发式（`623/tcp`、`5900` iKVM + Web、或 CIM/WBEM / iLO 控制台端口） |
 
@@ -117,6 +117,7 @@ dotnet publish src/ScanBMC.App/ScanBMC.App.csproj `
 
 ```text
 ScanBMC.sln
+├── Directory.Build.props          # 统一版本号配置
 ├── src/
 │   ├── ScanBMC.Core/              # 零第三方依赖的 .NET 8 扫描核心库
 │   │   ├── Models.cs              # 数据结构、ScanConfig、ProbeStats

@@ -40,7 +40,7 @@ Unlike generic port scanners that guess device types from open TCP ports, ScanBM
 - **Native Windows Desktop Workflow**:
   - High-concurrency asynchronous engine (`async/await` + `SemaphoreSlim` + `CancellationToken`).
   - Automatic local subnet discovery via native .NET `NetworkInterface` APIs, plus ARP neighbor fast mode.
-  - Real-time search, segmented filtering (`BMC` / `Alerts` / `All Alive`), column sorting, structured device inspector, browser launch, and one-click **CSV (UTF-8 BOM)** / **JSON** export.
+  - Real-time search, segmented filtering (`BMC` / `Alerts` / `All Alive`), column sorting, structured device inspector, browser launch, and view-aware **CSV (UTF-8 BOM, Excel formula-injection protected)** / **JSON** export.
 
 ---
 
@@ -53,7 +53,7 @@ Evidence is weighted from strongest to weakest; only verified management protoco
 | UDP/623 IPMI RMCP (`Get Channel Auth Cap`) | **Confirmed** | Extracts IPMI 1.5/2.0 support, authentication types, IANA OEM ID, and anonymous/null-user flags |
 | UDP/623 IPMI (`Get Device ID`) | **Confirmed** | Unauthenticated fallback when auth-cap is blocked; retrieves firmware revision, IPMI version, manufacturer, and product ID |
 | UDP/623 ASF Presence Pong | **Confirmed** | Fallback for BMCs that block IPMI commands while still answering ASF Ping |
-| `/redfish/v1/` JSON response | **Confirmed** | HTTP `200`, `401`, or `403` with JSON payload confirms a Redfish service root |
+| `/redfish/v1/` JSON response | **Confirmed** | HTTP `200`, `401`, or `403` JSON containing Redfish/OData protocol markers (`RedfishVersion`, `@odata.*`, `OData-Version`, etc.) confirms a Redfish service root |
 | HTTP(S) Web Fingerprint | **Likely** | Matches `Server` header, HTML `<title>`, `WWW-Authenticate` realm, cookies, and decompressed response body |
 | Management Port Combination | **Possible** | Weak heuristic (`623/tcp`, `5900` iKVM + Web, or CIM/WBEM / iLO console ports) |
 
@@ -117,6 +117,7 @@ dotnet publish src/ScanBMC.App/ScanBMC.App.csproj `
 
 ```text
 ScanBMC.sln
+├── Directory.Build.props          # Centralized version definition
 ├── src/
 │   ├── ScanBMC.Core/              # Zero-dependency .NET 8 scanning engine
 │   │   ├── Models.cs              # Domain models, ScanConfig, ProbeStats
