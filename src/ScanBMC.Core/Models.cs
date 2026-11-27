@@ -6,7 +6,7 @@ namespace ScanBMC.Core;
 
 public static class ScanConstants
 {
-    public const string Version = "2.0.0";
+    public const string Version = "2.0.1";
     public const int IpmiUdpPort = 623;
 
     public const string ConfConfirmed = "确认";
