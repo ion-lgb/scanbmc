@@ -1,12 +1,25 @@
 using System.Collections.Concurrent;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text.Json.Serialization;
 
 namespace ScanBMC.Core;
 
 public static class ScanConstants
 {
-    public const string Version = "2.0.1";
+    public static string Version { get; } = ResolveVersion();
+
+    private static string ResolveVersion()
+    {
+        var asm = typeof(ScanConstants).Assembly;
+        var infoVer = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(infoVer))
+        {
+            int plusIdx = infoVer.IndexOf('+');
+            return plusIdx >= 0 ? infoVer[..plusIdx] : infoVer;
+        }
+        return asm.GetName().Version?.ToString(3) ?? "0.0.0";
+    }
     public const int IpmiUdpPort = 623;
 
     public const string ConfConfirmed = "确认";
@@ -136,6 +149,10 @@ public sealed class HostResult
     public List<PortResult> Ports { get; init; } = new();
     public IpmiInfo? Ipmi { get; set; }
     public bool AsfPong { get; set; }
+
+    [JsonIgnore]
+    public AsfPongInfo? AsfInfo { get; set; }
+
     public DeviceIdInfo? DeviceId { get; set; }
     public RedfishInfo? Redfish { get; set; }
     public List<WebInfo> Web { get; init; } = new();

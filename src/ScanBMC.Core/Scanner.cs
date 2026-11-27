@@ -99,11 +99,26 @@ public static class Scanner
         ProbeStats? stats,
         CancellationToken ct) where T : class
     {
+        var (result, _) = await UdpSendInternalAsync(ip, udpPort, packet, timeout, retries, parser, stats, ct)
+            .ConfigureAwait(false);
+        return result;
+    }
+
+    private static async Task<(T? Result, bool StopHost)> UdpSendInternalAsync<T>(
+        string ip,
+        int udpPort,
+        byte[] packet,
+        TimeSpan timeout,
+        int retries,
+        PacketParser<T> parser,
+        ProbeStats? stats,
+        CancellationToken ct) where T : class
+    {
         var remoteEp = new IPEndPoint(IPAddress.Parse(ip), udpPort);
 
         for (int attempt = 0; attempt <= retries; attempt++)
         {
-            if (ct.IsCancellationRequested) return null;
+            if (ct.IsCancellationRequested) return (null, true);
 
             using var udp = new UdpClient(AddressFamily.InterNetwork);
             try
@@ -129,26 +144,35 @@ public static class Scanner
                         break;
                     }
 
-                    if (!recv.RemoteEndPoint.Address.Equals(remoteEp.Address))
+                    if (!recv.RemoteEndPoint.Address.Equals(remoteEp.Address) ||
+                        recv.RemoteEndPoint.Port != remoteEp.Port)
+                    {
                         continue;
+                    }
 
                     T? parsed = parser(recv.Buffer);
                     if (parsed is not null)
-                        return parsed;
+                        return (parsed, false);
                 }
             }
             catch (OperationCanceledException)
             {
-                return null;
+                return (null, true);
             }
             catch (SocketException ex)
             {
                 if (ProbeStats.IsSystemic(ex.SocketErrorCode) || ProbeStats.IsHostDown(ex.SocketErrorCode))
+                {
                     stats?.AddSocketError(ex.SocketErrorCode);
-                return null;
+                    return (null, true);
+                }
+                if (ex.SocketErrorCode == SocketError.ConnectionReset)
+                    return (null, true);
+                if (attempt < retries) continue;
+                return (null, false);
             }
         }
-        return null;
+        return (null, false);
     }
 
     public static async Task<List<HostResult>> ScanAsync(
@@ -174,19 +198,14 @@ public static class Scanner
         foreach (var ip in targets)
         {
             if (config.EnableUdp)
-            {
-                probeItems.Add(("udp_ipmi", ip, config.IpmiUdpPort));
-                probeItems.Add(("udp_asf", ip, config.IpmiUdpPort));
-                probeItems.Add(("udp_devid", ip, config.IpmiUdpPort));
-            }
+                probeItems.Add(("udp_bmc", ip, config.IpmiUdpPort));
             foreach (var port in config.TcpPorts)
-            {
                 probeItems.Add(("tcp", ip, port));
-            }
         }
 
         int total1 = probeItems.Count;
         int done1 = 0;
+        int reportStep1 = Math.Max(4, total1 / 200);
         int maxConcurrency = Math.Max(1, config.Concurrency);
 
         using (var sem = new SemaphoreSlim(maxConcurrency, maxConcurrency))
@@ -209,42 +228,49 @@ public static class Scanner
                     try
                     {
                         if (ct.IsCancellationRequested) return;
-                        switch (item.Kind)
+                        if (item.Kind == "udp_bmc")
                         {
-                            case "udp_ipmi":
-                                var ipmi = await UdpSendAsync(
-                                    item.Ip, item.Port, IpmiProtocol.GetChannelAuthCapPacket,
-                                    config.Timeout, config.Retries, IpmiProtocol.ParseChannelAuthCap,
-                                    stats, ct).ConfigureAwait(false);
-                                if (ipmi is not null)
-                                    lock (hostLocks[item.Ip]) hosts[item.Ip].Ipmi = ipmi;
-                                break;
+                            // 同主机 UDP/623 串行发送，避免低性能嵌入式 BMC 并发丢包，并在明确不可达时提前短路
+                            var (ipmi, stop1) = await UdpSendInternalAsync(
+                                item.Ip, item.Port, IpmiProtocol.GetChannelAuthCapPacket,
+                                config.Timeout, config.Retries, IpmiProtocol.ParseChannelAuthCap,
+                                stats, ct).ConfigureAwait(false);
+                            if (ipmi is not null)
+                                lock (hostLocks[item.Ip]) hosts[item.Ip].Ipmi = ipmi;
+                            if (stop1 || ct.IsCancellationRequested) return;
 
-                            case "udp_asf":
-                                var pong = await UdpSendAsync(
+                            var (devId, stop2) = await UdpSendInternalAsync(
+                                item.Ip, item.Port, IpmiProtocol.GetDeviceIdPacket,
+                                config.Timeout, config.Retries, IpmiProtocol.ParseDeviceId,
+                                stats, ct).ConfigureAwait(false);
+                            if (devId is not null)
+                                lock (hostLocks[item.Ip]) hosts[item.Ip].DeviceId = devId;
+                            if (stop2 || ct.IsCancellationRequested) return;
+
+                            // 已确认 IPMI 应答则无需补发 ASF Presence Ping
+                            if (ipmi is null && devId is null)
+                            {
+                                var (pong, _) = await UdpSendInternalAsync(
                                     item.Ip, item.Port, IpmiProtocol.AsfPresencePingPacket,
                                     config.Timeout, config.Retries, IpmiProtocol.ParseAsfPong,
                                     stats, ct).ConfigureAwait(false);
                                 if (pong is not null)
-                                    lock (hostLocks[item.Ip]) hosts[item.Ip].AsfPong = true;
-                                break;
-
-                            case "udp_devid":
-                                var devId = await UdpSendAsync(
-                                    item.Ip, item.Port, IpmiProtocol.GetDeviceIdPacket,
-                                    config.Timeout, config.Retries, IpmiProtocol.ParseDeviceId,
-                                    stats, ct).ConfigureAwait(false);
-                                if (devId is not null)
-                                    lock (hostLocks[item.Ip]) hosts[item.Ip].DeviceId = devId;
-                                break;
-
-                            default:
-                                var tcpRes = await TcpProbeAsync(
-                                    item.Ip, item.Port, config.Timeout, config.Retries,
-                                    webPorts, stats, ct).ConfigureAwait(false);
-                                if (tcpRes is not null)
-                                    lock (hostLocks[item.Ip]) hosts[item.Ip].Ports.Add(tcpRes);
-                                break;
+                                {
+                                    lock (hostLocks[item.Ip])
+                                    {
+                                        hosts[item.Ip].AsfPong = true;
+                                        hosts[item.Ip].AsfInfo = pong;
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            var tcpRes = await TcpProbeAsync(
+                                item.Ip, item.Port, config.Timeout, config.Retries,
+                                webPorts, stats, ct).ConfigureAwait(false);
+                            if (tcpRes is not null)
+                                lock (hostLocks[item.Ip]) hosts[item.Ip].Ports.Add(tcpRes);
                         }
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
@@ -257,7 +283,7 @@ public static class Scanner
                         if (!ct.IsCancellationRequested)
                         {
                             int cur = Interlocked.Increment(ref done1);
-                            if (cur == total1 || cur % 4 == 0)
+                            if (cur == total1 || cur % reportStep1 == 0)
                                 progress?.Report(new ScanProgress(cur, total1, "probe"));
                         }
                     }
@@ -326,7 +352,12 @@ public static class Scanner
                                 {
                                     lock (hostLocks[item.Ip])
                                     {
-                                        if (hosts[item.Ip].Redfish is null || item.Port == 443)
+                                        var existing = hosts[item.Ip].Redfish;
+                                        bool existingIsTls = existing is not null && webPorts.GetValueOrDefault(existing.Port);
+                                        bool preferNew = existing is null
+                                            || (item.Tls && !existingIsTls)
+                                            || (item.Port == 443 && existing.Port != 443);
+                                        if (preferNew)
                                             hosts[item.Ip].Redfish = rf;
                                     }
                                 }
@@ -352,10 +383,18 @@ public static class Scanner
             }
         }
 
-        // 汇总与分类
+        // 汇总与分类（先排序端口与 Web 列表，确保并发写入下输出完全确定）
         var results = hosts.Values.Where(h => h.IsAlive).ToList();
         foreach (var host in results)
+        {
+            host.Ports.Sort((a, b) => a.Port.CompareTo(b.Port));
+            host.Web.Sort((a, b) =>
+            {
+                int tlsCmp = (a.Scheme != "https").CompareTo(b.Scheme != "https");
+                return tlsCmp != 0 ? tlsCmp : a.Port.CompareTo(b.Port);
+            });
             Classifier.Classify(host);
+        }
 
         results.Sort((a, b) =>
         {

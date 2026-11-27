@@ -48,6 +48,8 @@ public static partial class HttpProbe
             int available = Math.Min(size, body.Length - dataStart);
             if (available > 0)
                 ms.Write(body, dataStart, available);
+            if (available < size)
+                break;
 
             pos = dataStart + size;
             while (pos < body.Length && (body[pos] == '\r' || body[pos] == '\n'))
@@ -123,9 +125,14 @@ public static partial class HttpProbe
     public static CertInfo? ExtractCertInfo(X509Certificate? remoteCert)
     {
         if (remoteCert is null) return null;
+        X509Certificate2? ownedCert = null;
         try
         {
-            using var cert2 = remoteCert as X509Certificate2 ?? new X509Certificate2(remoteCert);
+            if (remoteCert is not X509Certificate2 cert2)
+            {
+                ownedCert = new X509Certificate2(remoteCert);
+                cert2 = ownedCert;
+            }
             DateTime notAfterUtc = cert2.NotAfter.ToUniversalTime();
             int daysLeft = (int)Math.Floor((notAfterUtc - DateTime.UtcNow).TotalDays);
             string cn = cert2.GetNameInfo(X509NameType.SimpleName, false) ?? "";
@@ -143,6 +150,10 @@ public static partial class HttpProbe
         {
             return null;
         }
+        finally
+        {
+            ownedCert?.Dispose();
+        }
     }
 
     public static async Task<RawHttpResponse?> SendRequestAsync(
@@ -157,6 +168,7 @@ public static partial class HttpProbe
         linked.CancelAfter(timeout);
 
         using var tcp = new TcpClient(AddressFamily.InterNetwork);
+        SslStream? ssl = null;
         try
         {
             await tcp.ConnectAsync(ip, port, linked.Token).ConfigureAwait(false);
@@ -165,30 +177,22 @@ public static partial class HttpProbe
 
             if (tls)
             {
-                var ssl = new SslStream(stream, false, (_, cert, _, _) =>
+                ssl = new SslStream(stream, leaveInnerStreamOpen: true, (_, cert, _, _) =>
                 {
                     certInfo = ExtractCertInfo(cert);
                     return true;
                 });
-                try
-                {
 #pragma warning disable SYSLIB0039 // 兼容老旧 BMC 的 TLS 1.0/1.1
-                    var sslOpts = new SslClientAuthenticationOptions
-                    {
-                        TargetHost = "",
-                        EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13 | SslProtocols.Tls11 | SslProtocols.Tls,
-                        CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-                    };
-#pragma warning restore SYSLIB0039
-                    await ssl.AuthenticateAsClientAsync(sslOpts, linked.Token).ConfigureAwait(false);
-                    certInfo ??= ExtractCertInfo(ssl.RemoteCertificate);
-                    stream = ssl;
-                }
-                catch
+                var sslOpts = new SslClientAuthenticationOptions
                 {
-                    await ssl.DisposeAsync().ConfigureAwait(false);
-                    return null;
-                }
+                    TargetHost = "",
+                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13 | SslProtocols.Tls11 | SslProtocols.Tls,
+                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+                };
+#pragma warning restore SYSLIB0039
+                await ssl.AuthenticateAsClientAsync(sslOpts, linked.Token).ConfigureAwait(false);
+                certInfo ??= ExtractCertInfo(ssl.RemoteCertificate);
+                stream = ssl;
             }
 
             string host = ip.Contains(':') ? $"[{ip}]" : ip;
@@ -218,6 +222,9 @@ public static partial class HttpProbe
                 }
                 if (read <= 0) break;
                 ms.Write(buffer, 0, read);
+
+                if (IsHttpResponseComplete(ms))
+                    break;
             }
 
             byte[] raw = ms.ToArray();
@@ -228,6 +235,11 @@ public static partial class HttpProbe
         catch
         {
             return null;
+        }
+        finally
+        {
+            if (ssl is not null)
+                await ssl.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -283,12 +295,60 @@ public static partial class HttpProbe
         };
     }
 
+    private static bool IsHttpResponseComplete(MemoryStream ms)
+    {
+        if (!ms.TryGetBuffer(out var seg))
+            return false;
+
+        ReadOnlySpan<byte> data = seg.AsSpan();
+        int sepIdx = data.IndexOf("\r\n\r\n"u8);
+        if (sepIdx < 0)
+            return false;
+
+        int bodyStart = sepIdx + 4;
+        int bodyLen = data.Length - bodyStart;
+        string headText = Encoding.Latin1.GetString(data[..sepIdx]);
+
+        long contentLength = -1;
+        bool isChunked = false;
+        foreach (var rawLine in headText.Split("\r\n"))
+        {
+            int colon = rawLine.IndexOf(':');
+            if (colon <= 0) continue;
+            string name = rawLine[..colon].Trim();
+            string val = rawLine[(colon + 1)..].Trim();
+            if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+            {
+                if (long.TryParse(val, out long len) && len >= 0)
+                    contentLength = len;
+            }
+            else if (name.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase) &&
+                     val.Contains("chunked", StringComparison.OrdinalIgnoreCase))
+            {
+                isChunked = true;
+            }
+        }
+
+        if (contentLength >= 0)
+            return bodyLen >= contentLength;
+
+        if (isChunked && bodyLen >= 5)
+        {
+            ReadOnlySpan<byte> body = data[bodyStart..];
+            if (body.StartsWith("0\r\n\r\n"u8) || body.IndexOf("\r\n0\r\n\r\n"u8) >= 0)
+                return true;
+        }
+
+        return false;
+    }
+
     public static async Task<WebInfo?> ProbeWebAsync(
         string ip, int port, bool tls, TimeSpan timeout, int retries, CancellationToken ct)
     {
         RawHttpResponse? resp = null;
         for (int i = 0; i <= retries; i++)
         {
+            if (ct.IsCancellationRequested) return null;
             resp = await SendRequestAsync(ip, port, tls, "/", timeout, ct).ConfigureAwait(false);
             if (resp is not null) break;
         }
@@ -316,16 +376,15 @@ public static partial class HttpProbe
         };
     }
 
-    public static async Task<RedfishInfo?> ProbeRedfishAsync(
-        string ip, int port, bool tls, TimeSpan timeout, int retries, CancellationToken ct)
+    private static readonly string[] RedfishCollectionKeys =
     {
-        RawHttpResponse? resp = null;
-        for (int i = 0; i <= retries; i++)
-        {
-            resp = await SendRequestAsync(ip, port, tls, "/redfish/v1/", timeout, ct).ConfigureAwait(false);
-            if (resp is not null) break;
-        }
-        if (resp is null || resp.Status is not (200 or 401 or 403))
+        "Systems", "Managers", "Chassis", "SessionService",
+        "AccountService", "UpdateService", "EventService",
+    };
+
+    public static RedfishInfo? ParseRedfishResponse(int port, RawHttpResponse resp)
+    {
+        if (resp.Status is not (200 or 401 or 403))
             return null;
 
         resp.Headers.TryGetValue("content-type", out var ctype);
@@ -334,6 +393,14 @@ public static partial class HttpProbe
         if (!looksJson) return null;
 
         resp.Headers.TryGetValue("server", out var server);
+        resp.Headers.TryGetValue("odata-version", out var odataVersion);
+        resp.Headers.TryGetValue("www-authenticate", out var wwwAuth);
+
+        bool hasEvidence =
+            !string.IsNullOrWhiteSpace(odataVersion) ||
+            (!string.IsNullOrEmpty(server) && (server.Contains("redfish", StringComparison.OrdinalIgnoreCase) || !string.IsNullOrEmpty(Classifier.MatchSignature(server)))) ||
+            (!string.IsNullOrEmpty(wwwAuth) && wwwAuth.Contains("redfish", StringComparison.OrdinalIgnoreCase));
+
         string vendor = "";
         string product = "";
         string version = "";
@@ -344,13 +411,65 @@ public static partial class HttpProbe
             using var doc = JsonDocument.Parse(body);
             if (doc.RootElement.ValueKind == JsonValueKind.Object)
             {
-                if (doc.RootElement.TryGetProperty("Vendor", out var vEl) && vEl.ValueKind == JsonValueKind.String)
+                var root = doc.RootElement;
+                if (root.TryGetProperty("Vendor", out var vEl) && vEl.ValueKind == JsonValueKind.String)
                     vendor = Classifier.CleanValue(vEl.GetString());
-                if (doc.RootElement.TryGetProperty("Product", out var pEl) && pEl.ValueKind == JsonValueKind.String)
+                if (root.TryGetProperty("Product", out var pEl) && pEl.ValueKind == JsonValueKind.String)
                     product = Classifier.CleanValue(pEl.GetString());
-                if (doc.RootElement.TryGetProperty("RedfishVersion", out var rvEl) && rvEl.ValueKind == JsonValueKind.String)
+                if (root.TryGetProperty("RedfishVersion", out var rvEl) && rvEl.ValueKind == JsonValueKind.String)
+                {
                     version = rvEl.GetString() ?? "";
-                if (doc.RootElement.TryGetProperty("Oem", out var oemEl) && oemEl.ValueKind == JsonValueKind.Object)
+                    if (!string.IsNullOrWhiteSpace(version))
+                        hasEvidence = true;
+                }
+                if (root.TryGetProperty("@odata.type", out var odataType) && odataType.ValueKind == JsonValueKind.String)
+                {
+                    string t = odataType.GetString() ?? "";
+                    if (t.Contains("ServiceRoot", StringComparison.OrdinalIgnoreCase) ||
+                        t.Contains("Redfish", StringComparison.OrdinalIgnoreCase) ||
+                        t.StartsWith('#'))
+                    {
+                        hasEvidence = true;
+                    }
+                }
+                if (root.TryGetProperty("@odata.id", out var odataId) && odataId.ValueKind == JsonValueKind.String &&
+                    (odataId.GetString() ?? "").Contains("/redfish/v1", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasEvidence = true;
+                }
+                if (root.TryGetProperty("@odata.context", out var odataCtx) && odataCtx.ValueKind == JsonValueKind.String &&
+                    (odataCtx.GetString() ?? "").Contains("/redfish/v1", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasEvidence = true;
+                }
+                if (!hasEvidence)
+                {
+                    foreach (var key in RedfishCollectionKeys)
+                    {
+                        if (root.TryGetProperty(key, out var colEl) &&
+                            colEl.ValueKind == JsonValueKind.Object &&
+                            colEl.TryGetProperty("@odata.id", out _))
+                        {
+                            hasEvidence = true;
+                            break;
+                        }
+                    }
+                }
+                if (!hasEvidence && root.TryGetProperty("error", out var errEl) && errEl.ValueKind == JsonValueKind.Object)
+                {
+                    if (errEl.TryGetProperty("@Message.ExtendedInfo", out _))
+                        hasEvidence = true;
+                    else if (errEl.TryGetProperty("code", out var codeEl) && codeEl.ValueKind == JsonValueKind.String)
+                    {
+                        string code = codeEl.GetString() ?? "";
+                        if (code.StartsWith("Base.", StringComparison.OrdinalIgnoreCase) ||
+                            code.Contains("Redfish", StringComparison.OrdinalIgnoreCase))
+                        {
+                            hasEvidence = true;
+                        }
+                    }
+                }
+                if (root.TryGetProperty("Oem", out var oemEl) && oemEl.ValueKind == JsonValueKind.Object)
                 {
                     foreach (var prop in oemEl.EnumerateObject().Take(5))
                     {
@@ -362,8 +481,20 @@ public static partial class HttpProbe
         }
         catch
         {
-            // 截断或非标准 JSON 仍可凭状态码与 Server 头确认 Redfish
+            // 截断 JSON 时凭明确的 Redfish/OData 协议标记兜底确认
+            if (!hasEvidence && (
+                body.Contains("\"RedfishVersion\"", StringComparison.OrdinalIgnoreCase) ||
+                body.Contains("\"@odata.type\"", StringComparison.OrdinalIgnoreCase) ||
+                body.Contains("\"@odata.id\"", StringComparison.OrdinalIgnoreCase) ||
+                body.Contains("/redfish/v1", StringComparison.OrdinalIgnoreCase) ||
+                body.Contains("\"@Message.ExtendedInfo\"", StringComparison.OrdinalIgnoreCase)))
+            {
+                hasEvidence = true;
+            }
         }
+
+        if (!hasEvidence)
+            return null;
 
         string bodySnippet = body.Length > 4096 ? body[..4096] : body;
         return new RedfishInfo
@@ -378,5 +509,18 @@ public static partial class HttpProbe
             Cert = resp.Cert,
             Haystack = $"{server ?? ""} {bodySnippet}",
         };
+    }
+
+    public static async Task<RedfishInfo?> ProbeRedfishAsync(
+        string ip, int port, bool tls, TimeSpan timeout, int retries, CancellationToken ct)
+    {
+        RawHttpResponse? resp = null;
+        for (int i = 0; i <= retries; i++)
+        {
+            if (ct.IsCancellationRequested) return null;
+            resp = await SendRequestAsync(ip, port, tls, "/redfish/v1/", timeout, ct).ConfigureAwait(false);
+            if (resp is not null) break;
+        }
+        return resp is null ? null : ParseRedfishResponse(port, resp);
     }
 }

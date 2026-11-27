@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -31,8 +32,16 @@ public sealed record IPv4Cidr(uint Network, int PrefixLength)
     public override string ToString() => $"{NetworkDiscovery.UIntToIp(Network)}/{PrefixLength}";
 }
 
+public readonly record struct IPv4Range(uint Start, uint End)
+{
+    public long Count => (long)End - Start + 1;
+    public bool Contains(uint ip) => ip >= Start && ip <= End;
+}
+
 public static partial class NetworkDiscovery
 {
+    public const int DefaultMaxExpandTargets = 1_048_576;
+
     public static uint IpToUInt(IPAddress ip)
     {
         byte[] b = ip.GetAddressBytes();
@@ -44,22 +53,42 @@ public static partial class NetworkDiscovery
     public static string UIntToIp(uint value) =>
         $"{(value >> 24) & 0xFF}.{(value >> 16) & 0xFF}.{(value >> 8) & 0xFF}.{value & 0xFF}";
 
+    /// <summary>严格解析点分四段十进制 IPv4，避免 IPAddress.TryParse 接受 "192.168.1" 等 inet_aton 简写。</summary>
+    public static bool TryParseStrictIPv4(string text, out IPAddress ip)
+    {
+        ip = IPAddress.None;
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        var parts = text.Trim().Split('.');
+        if (parts.Length != 4) return false;
+        byte[] bytes = new byte[4];
+        for (int i = 0; i < 4; i++)
+        {
+            if (parts[i].Length == 0 ||
+                !byte.TryParse(parts[i], NumberStyles.None, CultureInfo.InvariantCulture, out bytes[i]))
+            {
+                return false;
+            }
+        }
+        ip = new IPAddress(bytes);
+        return true;
+    }
+
     public static int? NetmaskToPrefix(string mask)
     {
         uint value;
         mask = mask.Trim();
         if (mask.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
         {
-            if (!uint.TryParse(mask[2..], System.Globalization.NumberStyles.HexNumber, null, out value))
+            if (!uint.TryParse(mask[2..], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value))
                 return null;
         }
         else if (mask.Contains('.'))
         {
-            if (!IPAddress.TryParse(mask, out var ip) || ip.AddressFamily != AddressFamily.InterNetwork)
+            if (!TryParseStrictIPv4(mask, out var ip))
                 return null;
             value = IpToUInt(ip);
         }
-        else if (int.TryParse(mask, out int prefix) && prefix is >= 0 and <= 32)
+        else if (int.TryParse(mask, NumberStyles.None, CultureInfo.InvariantCulture, out int prefix) && prefix is >= 0 and <= 32)
         {
             return prefix;
         }
@@ -85,9 +114,8 @@ public static partial class NetworkDiscovery
     {
         var parts = text.Split('/');
         if (parts.Length != 2 ||
-            !IPAddress.TryParse(parts[0].Trim(), out var ip) ||
-            ip.AddressFamily != AddressFamily.InterNetwork ||
-            !int.TryParse(parts[1].Trim(), out int prefix) ||
+            !TryParseStrictIPv4(parts[0].Trim(), out var ip) ||
+            !int.TryParse(parts[1].Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out int prefix) ||
             prefix < 0 || prefix > 32)
         {
             throw new FormatException($"非法 CIDR 网段: {text}");
@@ -97,15 +125,20 @@ public static partial class NetworkDiscovery
         return new IPv4Cidr(net, prefix);
     }
 
-    /// <summary>支持 CIDR(192.168.1.0/24)、单 IP、区间(192.168.1.10-50 或 10.0.0.1-10.0.0.99)。</summary>
-    public static List<uint> ParseTarget(string token)
+    /// <summary>将单个目标表达式解析为闭区间 [Start, End]（不展开 IP，避免大网段 OOM）。</summary>
+    public static IPv4Range? ParseTargetRange(string token)
     {
         token = token.Trim();
         if (string.IsNullOrEmpty(token))
-            return new List<uint>();
+            return null;
 
         if (token.Contains('/'))
-            return ParseCidr(token).EnumerateHosts().ToList();
+        {
+            var cidr = ParseCidr(token);
+            return cidr.PrefixLength >= 31
+                ? new IPv4Range(cidr.Network, cidr.Broadcast)
+                : new IPv4Range(cidr.Network + 1, cidr.Broadcast - 1);
+        }
 
         if (token.Contains('-'))
         {
@@ -113,20 +146,21 @@ public static partial class NetworkDiscovery
             var left = token[..idx].Trim();
             var right = token[(idx + 1)..].Trim();
 
-            if (!IPAddress.TryParse(left, out var startIp) || startIp.AddressFamily != AddressFamily.InterNetwork)
+            if (!TryParseStrictIPv4(left, out var startIp))
                 throw new FormatException($"非法起始 IP: {token}");
 
-            IPAddress? endIp;
+            IPAddress endIp;
             if (right.Contains('.'))
             {
-                if (!IPAddress.TryParse(right, out endIp) || endIp.AddressFamily != AddressFamily.InterNetwork)
+                if (!TryParseStrictIPv4(right, out endIp))
                     throw new FormatException($"非法结束 IP: {token}");
             }
             else
             {
-                var octets = left.Split('.');
-                if (octets.Length != 4 || !IPAddress.TryParse($"{octets[0]}.{octets[1]}.{octets[2]}.{right}", out endIp))
+                if (!byte.TryParse(right, NumberStyles.None, CultureInfo.InvariantCulture, out byte endOctet))
                     throw new FormatException($"非法结束段: {token}");
+                byte[] b = startIp.GetAddressBytes();
+                endIp = new IPAddress(new[] { b[0], b[1], b[2], endOctet });
             }
 
             uint s = IpToUInt(startIp);
@@ -134,57 +168,166 @@ public static partial class NetworkDiscovery
             if (e < s)
                 throw new FormatException($"区间起止顺序错误: {token}");
 
-            var list = new List<uint>((int)Math.Min((long)e - s + 1, 65536));
-            for (long i = s; i <= e; i++)
-                list.Add((uint)i);
-            return list;
+            return new IPv4Range(s, e);
         }
 
-        if (!IPAddress.TryParse(token, out var single) || single.AddressFamily != AddressFamily.InterNetwork)
+        if (!TryParseStrictIPv4(token, out var single))
             throw new FormatException($"非法 IP 地址: {token}");
-        return new List<uint> { IpToUInt(single) };
+        uint v = IpToUInt(single);
+        return new IPv4Range(v, v);
     }
 
-    public static List<string> BuildTargets(IEnumerable<string> specs, IEnumerable<string>? excludes = null)
+    /// <summary>支持 CIDR(192.168.1.0/24)、单 IP、区间(192.168.1.10-50 或 10.0.0.1-10.0.0.99)。</summary>
+    public static List<uint> ParseTarget(string token, int maxTargets = DefaultMaxExpandTargets)
     {
-        var seen = new SortedSet<uint>();
+        var range = ParseTargetRange(token);
+        if (range is null)
+            return new List<uint>();
+
+        var r = range.Value;
+        if (r.Count > maxTargets)
+            throw new InvalidOperationException($"目标数 {r.Count} 超过上限 {maxTargets}，请缩小网段范围。");
+
+        var list = new List<uint>((int)r.Count);
+        for (long i = r.Start; i <= r.End; i++)
+            list.Add((uint)i);
+        return list;
+    }
+
+    private static List<IPv4Range> MergeRanges(List<IPv4Range> ranges)
+    {
+        if (ranges.Count <= 1) return ranges;
+        ranges.Sort((a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
+
+        var merged = new List<IPv4Range>(ranges.Count) { ranges[0] };
+        for (int i = 1; i < ranges.Count; i++)
+        {
+            var cur = merged[^1];
+            var next = ranges[i];
+            if (next.Start <= (long)cur.End + 1)
+            {
+                if (next.End > cur.End)
+                    merged[^1] = new IPv4Range(cur.Start, next.End);
+            }
+            else
+            {
+                merged.Add(next);
+            }
+        }
+        return merged;
+    }
+
+    private static List<IPv4Range> SubtractRanges(List<IPv4Range> includes, List<IPv4Range> excludes)
+    {
+        if (includes.Count == 0 || excludes.Count == 0)
+            return includes;
+
+        var result = new List<IPv4Range>(includes.Count);
+        int exIdx = 0;
+
+        foreach (var inc in includes)
+        {
+            while (exIdx < excludes.Count && excludes[exIdx].End < inc.Start)
+                exIdx++;
+
+            long curStart = inc.Start;
+            int j = exIdx;
+            while (j < excludes.Count && excludes[j].Start <= inc.End)
+            {
+                var ex = excludes[j];
+                if (ex.Start > curStart)
+                    result.Add(new IPv4Range((uint)curStart, ex.Start - 1));
+
+                if (ex.End >= inc.End)
+                {
+                    curStart = (long)inc.End + 1;
+                    break;
+                }
+                curStart = Math.Max(curStart, (long)ex.End + 1);
+                j++;
+            }
+
+            if (curStart <= inc.End)
+                result.Add(new IPv4Range((uint)curStart, inc.End));
+        }
+
+        return result;
+    }
+
+    public static List<string> BuildTargets(
+        IEnumerable<string> specs,
+        IEnumerable<string>? excludes = null,
+        int? maxTargets = null)
+    {
+        var includeRanges = new List<IPv4Range>();
         foreach (var spec in specs)
         {
-            foreach (var ip in ParseTarget(spec))
-                seen.Add(ip);
+            if (ParseTargetRange(spec) is { } r)
+                includeRanges.Add(r);
         }
+
+        var merged = MergeRanges(includeRanges);
 
         if (excludes is not null)
         {
+            var excludeRanges = new List<IPv4Range>();
             foreach (var spec in excludes)
             {
-                foreach (var ip in ParseTarget(spec))
-                    seen.Remove(ip);
+                if (ParseTargetRange(spec) is { } r)
+                    excludeRanges.Add(r);
             }
+            if (excludeRanges.Count > 0)
+                merged = SubtractRanges(merged, MergeRanges(excludeRanges));
         }
 
-        return seen.Select(UIntToIp).ToList();
+        long totalCount = 0;
+        int limit = maxTargets ?? DefaultMaxExpandTargets;
+        foreach (var r in merged)
+        {
+            totalCount += r.Count;
+            if (totalCount > limit)
+                throw new InvalidOperationException($"目标数超过上限 {limit}，请缩小网段范围。");
+        }
+
+        var targets = new List<string>((int)totalCount);
+        foreach (var r in merged)
+        {
+            for (long i = r.Start; i <= r.End; i++)
+                targets.Add(UIntToIp((uint)i));
+        }
+        return targets;
     }
 
     public static List<string> FilterToSpecs(IEnumerable<string> ips, IEnumerable<string> specs)
     {
-        var allowed = new HashSet<uint>();
+        var rawRanges = new List<IPv4Range>();
         foreach (var spec in specs)
         {
-            foreach (var ip in ParseTarget(spec))
-                allowed.Add(ip);
+            if (ParseTargetRange(spec) is { } r)
+                rawRanges.Add(r);
         }
+        var allowed = MergeRanges(rawRanges);
 
         var result = new List<string>();
         var added = new HashSet<string>();
         foreach (var ipStr in ips)
         {
             if (IPAddress.TryParse(ipStr, out var addr) &&
-                addr.AddressFamily == AddressFamily.InterNetwork &&
-                allowed.Contains(IpToUInt(addr)) &&
-                added.Add(ipStr))
+                addr.AddressFamily == AddressFamily.InterNetwork)
             {
-                result.Add(ipStr);
+                uint v = IpToUInt(addr);
+                bool hit = false;
+                foreach (var r in allowed)
+                {
+                    if (r.Contains(v))
+                    {
+                        hit = true;
+                        break;
+                    }
+                    if (r.Start > v) break;
+                }
+                if (hit && added.Add(ipStr))
+                    result.Add(ipStr);
             }
         }
         return result;
@@ -282,26 +425,39 @@ public static partial class NetworkDiscovery
         return seen;
     }
 
-    public static List<string> GetArpNeighbors()
+    public static async Task<List<string>> GetArpNeighborsAsync(CancellationToken ct = default)
     {
         try
         {
             var psi = new ProcessStartInfo("arp", "-a")
             {
                 RedirectStandardOutput = true,
-                RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
             using var proc = Process.Start(psi);
             if (proc is null) return new List<string>();
-            string output = proc.StandardOutput.ReadToEnd();
-            proc.WaitForExit(5000);
-            return ParseArpOutput(output);
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+            try
+            {
+                string output = await proc.StandardOutput.ReadToEndAsync(timeoutCts.Token).ConfigureAwait(false);
+                await proc.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
+                return ParseArpOutput(output);
+            }
+            catch
+            {
+                try { if (!proc.HasExited) proc.Kill(); } catch { }
+                return new List<string>();
+            }
         }
         catch
         {
             return new List<string>();
         }
     }
+
+    public static List<string> GetArpNeighbors() =>
+        GetArpNeighborsAsync().GetAwaiter().GetResult();
 }

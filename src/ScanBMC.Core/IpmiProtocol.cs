@@ -186,9 +186,12 @@ public static class IpmiProtocol
             };
         }
 
-        int fwMajor = Bcd(payload[3]);
-        int fwMinor = Bcd(payload[2] & 0x7F);
+        // IPMI 2.0 Table 20-2:
+        // Byte 4 (payload[2]): [7] 可用标志 (0=正常, 1=更新/不可用), [6:0] 主固件版本 (二进制编码)
+        // Byte 5 (payload[3]): 次固件版本 (BCD 编码)
         bool available = (payload[2] & 0x80) == 0;
+        int fwMajor = payload[2] & 0x7F;
+        int fwMinor = Bcd(payload[3]);
 
         byte ipmiVer = payload[4];
         string verStr = ipmiVer == 0x00 ? "" : $"{ipmiVer & 0x0F}.{ipmiVer >> 4}";

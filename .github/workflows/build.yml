@@ -2,13 +2,17 @@ name: 构建发布 (Windows .NET 8)
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: build-${{ github.ref }}
@@ -28,23 +32,28 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: 运行单元测试与集成测试
-        run: dotnet test ScanBMC.sln -c Release --verbosity normal
+      - name: 构建解决方案并运行单元测试与集成测试
+        run: |
+          dotnet build ScanBMC.sln -c Release
+          dotnet test ScanBMC.sln -c Release --no-build --verbosity normal
 
       - name: 计算版本号
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             VER="${GITHUB_REF_NAME#v}"
           else
-            VER=$(grep -oPm1 "(?<=<Version>)[^<]+" src/ScanBMC.App/ScanBMC.App.csproj)
+            VER=$(grep -oPm1 "(?<=<Version>)[^<]+" Directory.Build.props)
           fi
           echo "VER=${VER}" >> "$GITHUB_ENV"
 
       - name: 发布 Windows 单文件版 (自包含)
+        if: github.event_name != 'pull_request'
         run: >
           dotnet publish src/ScanBMC.App/ScanBMC.App.csproj
           -c Release -r win-x64 --self-contained true
+          -p:Version=${{ env.VER }}
           -p:PublishSingleFile=true
           -p:IncludeNativeLibrariesForSelfExtract=true
           -p:EnableCompressionInSingleFile=true
@@ -52,6 +61,7 @@ jobs:
           -o publish/win-x64
 
       - name: 冒烟测试打包产物
+        if: github.event_name != 'pull_request'
         shell: pwsh
         run: |
           $env:SCANBMC_GUI_SMOKE = "1"
@@ -59,6 +69,7 @@ jobs:
           if ($p.ExitCode -ne 0) { exit $p.ExitCode }
 
       - name: 重命名产物
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           mkdir -p release_artifacts
@@ -66,6 +77,7 @@ jobs:
           ls -lh release_artifacts/
 
       - name: 上传构建产物 (Artifact)
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: ScanBMC-windows-x64

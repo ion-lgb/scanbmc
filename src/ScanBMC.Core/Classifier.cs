@@ -16,16 +16,16 @@ public static class Classifier
         (new Regex(@"idrac|integrated\s+dell\s+remote\s+access", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Dell iDRAC"),
         (new Regex(@"\bilo\b|hp-?ilo|integrated\s+lights-?out", RegexOptions.IgnoreCase | RegexOptions.Compiled), "HPE iLO"),
         (new Regex(@"\bcimc\b|cisco\s+integrated\s+management", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Cisco IMC"),
-        (new Regex(@"\birmc\b|fujitsu", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Fujitsu iRMC"),
+        (new Regex(@"\birmc\b|fujitsu.{0,40}(?:irmc|primergy|bmc)", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Fujitsu iRMC"),
         (new Regex(@"xclarity|\bxcc\b|integrated\s+management\s+module|\bimm2?\b", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Lenovo XClarity / IBM IMM"),
-        (new Regex(@"\bibmc\b|huawei", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Huawei iBMC"),
+        (new Regex(@"\bibmc\b|huawei.{0,40}(?:ibmc|bmc|fusionserver|taishan|rack|blade)", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Huawei iBMC"),
         (new Regex(@"supermicro", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Supermicro BMC"),
         (new Regex(@"megarac", RegexOptions.IgnoreCase | RegexOptions.Compiled), "AMI MegaRAC BMC"),
         (new Regex(@"\baten\b", RegexOptions.IgnoreCase | RegexOptions.Compiled), "ATEN / Supermicro BMC"),
         (new Regex(@"inspur", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Inspur BMC"),
-        (new Regex(@"\bh3c\b|\bhdm\b", RegexOptions.IgnoreCase | RegexOptions.Compiled), "H3C HDM"),
+        (new Regex(@"\bhdm\b|h3c.{0,40}(?:hdm|bmc|uniserver)", RegexOptions.IgnoreCase | RegexOptions.Compiled), "H3C HDM"),
         (new Regex(@"asrock\s*rack", RegexOptions.IgnoreCase | RegexOptions.Compiled), "ASRock Rack BMC"),
-        (new Regex(@"gigabyte", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Gigabyte BMC"),
+        (new Regex(@"gigabyte.{0,40}(?:bmc|megarac|ipmi|server\s+management)", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Gigabyte BMC"),
         (new Regex(@"\btyan\b", RegexOptions.IgnoreCase | RegexOptions.Compiled), "Tyan BMC"),
         (new Regex(@"openbmc", RegexOptions.IgnoreCase | RegexOptions.Compiled), "OpenBMC"),
         (new Regex(@"aspeed", RegexOptions.IgnoreCase | RegexOptions.Compiled), "ASPEED 芯片组 BMC"),
@@ -77,8 +77,18 @@ public static class Classifier
         }
         else if (host.AsfPong)
         {
-            evidence.Add("ASF Presence Pong (UDP/623)");
+            string asfDesc = "ASF Presence Pong (UDP/623)";
+            if (host.AsfInfo?.IpmiSupported == true)
+                asfDesc += " [支持 IPMI]";
+            evidence.Add(asfDesc);
             confidence = ScanConstants.ConfConfirmed;
+
+            if (host.AsfInfo?.OemIana is uint iana && iana != 4542 && iana <= int.MaxValue &&
+                IpmiProtocol.OemIds.TryGetValue((int)iana, out var asfVendor))
+            {
+                vendor = $"{asfVendor} BMC";
+                evidence.Add($"ASF OEM IANA={iana} → {asfVendor}");
+            }
         }
 
         // 证据 1b：Get Device ID（auth-cap 被静默时兜底）
@@ -108,6 +118,12 @@ public static class Classifier
                     evidence.Add($"Get Device ID 厂商 ID={dev.ManufacturerId} → {dev.Manufacturer}");
                 }
             }
+        }
+        else if (host.DeviceId is { } devErr)
+        {
+            evidence.Add($"IPMI Get Device ID 应答 (完成码 0x{devErr.CompletionCode:X2})");
+            if (host.Ipmi is null && !host.AsfPong)
+                confidence = ScanConstants.ConfConfirmed;
         }
 
         // 证据 2：Redfish

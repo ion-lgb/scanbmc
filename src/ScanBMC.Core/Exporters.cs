@@ -57,6 +57,9 @@ public static class Exporters
 
     private static string CsvEscape(string s)
     {
+        // 防范 Excel 公式注入（CSV Injection）：对来自远端的不可信文本做前置单引号转义
+        if (s.Length > 0 && s[0] is '=' or '+' or '-' or '@' or '\t' or '\r')
+            s = "'" + s;
         if (s.Contains('"') || s.Contains(',') || s.Contains('\n') || s.Contains('\r'))
             return $"\"{s.Replace("\"", "\"\"")}\"";
         return s;

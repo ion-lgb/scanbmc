@@ -34,7 +34,7 @@ public class IntegrationTests
                 {
                     if (req.Buffer.Length > 19 && req.Buffer[19] == 0x01)
                     {
-                        byte[] payload = { 0x20, 0x01, 0x26, 0x06, 0x02, 0x00, 0x7C, 0x2A, 0x00, 0x00, 0x01 };
+                        byte[] payload = { 0x20, 0x01, 0x06, 0x26, 0x02, 0x00, 0x7C, 0x2A, 0x00, 0x00, 0x01 };
                         byte[] body = new byte[] { 0x81, 0x1C, 0x63, 0x20, 0x00, 0x01, 0x00 }.Concat(payload).ToArray();
                         byte[] resp = new byte[] { 0x06, 0x00, 0xFF, 0x07 }.Concat(new byte[9]).Concat(new[] { (byte)body.Length }).Concat(body).ToArray();
                         await udpServer.SendAsync(resp, req.RemoteEndPoint, cts.Token);
@@ -123,6 +123,54 @@ public class IntegrationTests
             cts.Cancel();
             tcpListener.Stop();
             await Task.WhenAll(udpTask, httpTask);
+        }
+    }
+
+    [Fact]
+    public async Task SendRequestAsync_ReturnsPromptlyOnKeepAliveContentLength()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        var serverTask = Task.Run(async () =>
+        {
+            try
+            {
+                using var client = await listener.AcceptTcpClientAsync(cts.Token);
+                var stream = client.GetStream();
+                byte[] buf = new byte[512];
+                _ = await stream.ReadAsync(buf, cts.Token);
+                string body = "{\"RedfishVersion\":\"1.15.0\"}";
+                string resp =
+                    $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {Encoding.UTF8.GetByteCount(body)}\r\nConnection: keep-alive\r\n\r\n{body}";
+                await stream.WriteAsync(Encoding.UTF8.GetBytes(resp), cts.Token);
+                await stream.FlushAsync(cts.Token);
+                // 故意保持连接不关闭，模拟忽略 Connection: close 的设备
+                await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
+            }
+            catch
+            {
+            }
+        });
+
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var resp = await HttpProbe.SendRequestAsync("127.0.0.1", port, false, "/redfish/v1/", TimeSpan.FromSeconds(3), cts.Token);
+            sw.Stop();
+
+            Assert.NotNull(resp);
+            Assert.Equal(200, resp!.Status);
+            Assert.Contains("1.15.0", resp.Body);
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(1.5), $"预期收到 Content-Length 完整正文后立刻返回，实际耗时 {sw.Elapsed.TotalMilliseconds:F0}ms");
+        }
+        finally
+        {
+            cts.Cancel();
+            listener.Stop();
+            await serverTask;
         }
     }
 }
