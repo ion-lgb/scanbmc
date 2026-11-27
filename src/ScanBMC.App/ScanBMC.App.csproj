@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <Version>2.0.0</Version>
+    <AssemblyName>ScanBMC</AssemblyName>
+    <RootNamespace>ScanBMC.App</RootNamespace>
+    <Product>ScanBMC</Product>
+    <Description>局域网服务器 BMC 扫描器 (Windows 原生版)</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ScanBMC.Core\ScanBMC.Core.csproj" />
+  </ItemGroup>
+
+</Project>

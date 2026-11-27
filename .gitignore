@@ -1,15 +1,14 @@
-# 虚拟环境 / 构建产物
-.venv/
-build/
-dist/
-.pyinstaller_cache/
+# .NET / Visual Studio
+bin/
+obj/
+publish/
+*.user
+*.suo
+*.cache
+.vs/
+TestResults/
+*.log
 
-# Python
-__pycache__/
-*.py[cod]
-
-# macOS
+# OS
 .DS_Store
-
-# 工具会话状态
-.reasonix/
+Thumbs.db

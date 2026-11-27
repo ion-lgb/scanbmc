@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.8.34330.188
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ScanBMC.Core", "src\ScanBMC.Core\ScanBMC.Core.csproj", "{B4C5D6E7-1111-4A11-9A11-000000000001}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ScanBMC.App", "src\ScanBMC.App\ScanBMC.App.csproj", "{B4C5D6E7-2222-4A22-9A22-000000000002}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ScanBMC.Core.Tests", "tests\ScanBMC.Core.Tests\ScanBMC.Core.Tests.csproj", "{B4C5D6E7-3333-4A33-9A33-000000000003}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B4C5D6E7-1111-4A11-9A11-000000000001}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B4C5D6E7-1111-4A11-9A11-000000000001}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B4C5D6E7-1111-4A11-9A11-000000000001}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B4C5D6E7-1111-4A11-9A11-000000000001}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B4C5D6E7-2222-4A22-9A22-000000000002}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B4C5D6E7-2222-4A22-9A22-000000000002}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B4C5D6E7-2222-4A22-9A22-000000000002}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B4C5D6E7-2222-4A22-9A22-000000000002}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B4C5D6E7-3333-4A33-9A33-000000000003}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B4C5D6E7-3333-4A33-9A33-000000000003}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B4C5D6E7-3333-4A33-9A33-000000000003}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B4C5D6E7-3333-4A33-9A33-000000000003}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

@@ -1,8 +1,5 @@
-name: 打包发布 (Build & Release)
+name: 构建发布 (Windows .NET 8)
 
-# 触发方式：
-#   1. 推送 tag（v1.0.0 之类）→ 自动构建单文件并发布到 Releases
-#   2. 手动触发 workflow_dispatch → 只构建并上传 Artifact，不发布 Release
 on:
   push:
     tags:
@@ -10,73 +7,29 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # 创建 Release 需要
-  actions: write    # 上传/删除 Artifact 需要（私有仓库必须）
+  contents: write
+  actions: write
 
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: ${{ matrix.os_name }}-${{ matrix.arch }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false   # 一个平台失败不耽误其他平台
-      matrix:
-        include:
-          # macOS 用 universal2 构建：一个文件同时兼容 Apple Silicon 与 Intel，
-          # 避免依赖接近退役、排队严重的 macos-13 (x86_64) runner
-          - os: macos-14
-            os_name: macos
-            arch: universal2
-          - os: windows-latest
-            os_name: windows
-            arch: x86_64
-          - os: ubuntu-22.04    # 选较老的 LTS 构建，产物兼容更多发行版
-            os_name: linux
-            arch: x86_64
+  build-windows:
+    name: windows-x86_64
+    runs-on: windows-latest
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Python
-        uses: actions/setup-python@v5
+      - name: 安装 .NET 8 SDK
+        uses: actions/setup-dotnet@v4
         with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: requirements-build.txt
+          dotnet-version: '8.0.x'
 
-      - name: 安装构建依赖（macOS 跳过，打包用下方 universal2 Python）
-        shell: bash
-        if: runner.os != 'macOS'
-        run: python3 -m pip install -r requirements-build.txt
-
-      - name: 安装 Qt 运行依赖 (Linux)
-        shell: bash
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
-            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 \
-            libxcb-xkb1 xvfb
-
-      - name: 单元测试
-        shell: bash
-        run: python3 -m unittest discover -p 'test_*.py'
-
-      - name: 安装 universal2 Python 与构建依赖 (macOS)
-        shell: bash
-        if: runner.os == 'macOS'
-        run: |
-          # PyInstaller 的 --target-arch universal2 需要 universal2 解释器；
-          # GitHub 自带的 Python 是单架构，改装 python.org 官方 universal2 包
-          curl -sSL -o /tmp/python-3.12.10-macos11.pkg \
-            https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg
-          sudo installer -pkg /tmp/python-3.12.10-macos11.pkg -target /
-          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 --version
-          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 -m pip install -r requirements-build.txt
+      - name: 运行单元测试与集成测试
+        run: dotnet test ScanBMC.sln -c Release --verbosity normal
 
       - name: 计算版本号
         shell: bash
@@ -84,63 +37,38 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             VER="${GITHUB_REF_NAME#v}"
           else
-            VER=$(python3 -c "import re; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('scanbmc.py', encoding='utf-8').read()).group(1))")
+            VER=$(grep -oPm1 "(?<=<Version>)[^<]+" src/ScanBMC.App/ScanBMC.App.csproj)
           fi
           echo "VER=${VER}" >> "$GITHUB_ENV"
 
-      - name: 用 PyInstaller 打包单文件 (--onefile)
-        shell: bash
-        env:
-          PYINSTALLER_CONFIG_DIR: ${{ github.workspace }}/.pyinstaller_cache
-        run: |
-          # --windowed：Windows 隐藏控制台窗口；macOS 上 Finder 双击不弹终端。
-          # 注意 PyInstaller 6.x 会对 macOS 的 "onefile + windowed" 组合打弃用警告，
-          # 并在 dist/ 额外生成一个 .app——无碍，重命名步骤只取单文件；
-          # 若未来 PyInstaller 7.x 将其变为报错，再改用 onedir .app 方案。
-          # macOS 用 universal2 Python 构建 fat 二进制，Intel/Apple Silicon 通用。
-          PY="python3"
-          TARGET=""
-          ARGS="--windowed"
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            PY=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12
-            TARGET="--target-arch universal2"
-          elif [ "$RUNNER_OS" = "Linux" ]; then
-            ARGS=""
-          fi
-          $PY -m PyInstaller --noconfirm --clean --onefile $ARGS $TARGET \
-            --specpath build/spec --name ScanBMC scanbmc_gui.py
-          ls -lh dist/
+      - name: 发布 Windows 单文件版 (自包含)
+        run: >
+          dotnet publish src/ScanBMC.App/ScanBMC.App.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=none
+          -o publish/win-x64
 
-      - name: Ad-hoc 签名 (macOS)
-        shell: bash
-        if: runner.os == 'macOS'
-        run: codesign --force -s - dist/ScanBMC
-
-      - name: 冒烟测试打包产物（2 秒自动退出，验证 Qt 插件齐全）
-        shell: bash
+      - name: 冒烟测试打包产物
+        shell: pwsh
         run: |
-          CMD="./dist/ScanBMC"
-          [ "$RUNNER_OS" = "Windows" ] && CMD="./dist/ScanBMC.exe"
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            SCANBMC_GUI_SMOKE=1 xvfb-run -a "$CMD"
-          else
-            SCANBMC_GUI_SMOKE=1 "$CMD"
-          fi
+          $env:SCANBMC_GUI_SMOKE = "1"
+          $p = Start-Process -FilePath "publish/win-x64/ScanBMC.exe" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
 
       - name: 重命名产物
         shell: bash
         run: |
           mkdir -p release_artifacts
-          SUFFIX=""
-          [ "$RUNNER_OS" = "Windows" ] && SUFFIX=".exe"
-          mv "dist/ScanBMC${SUFFIX}" \
-             "release_artifacts/ScanBMC-${VER}-${{ matrix.os_name }}-${{ matrix.arch }}${SUFFIX}"
+          mv publish/win-x64/ScanBMC.exe "release_artifacts/ScanBMC-${VER}-windows-x64.exe"
           ls -lh release_artifacts/
 
       - name: 上传构建产物 (Artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: ScanBMC-${{ matrix.os_name }}-${{ matrix.arch }}
+          name: ScanBMC-windows-x64
           path: release_artifacts/*
           if-no-files-found: error
           retention-days: 14
@@ -152,15 +80,6 @@ jobs:
           files: release_artifacts/*
           name: ScanBMC ${{ env.VER }}
           body: |
-            ## ScanBMC ${{ env.VER }} —— 全平台单文件版
+            ## ScanBMC ${{ env.VER }} — Windows 原生单文件版 (.NET 8 WPF)
 
-            下载对应平台的单个文件即可直接运行，无需安装 Python 或任何依赖。
-
-            - **macos-universal2**：Intel 与 Apple Silicon（M 系列）Mac 通用
-            - **windows-x86_64**：Windows 10/11（.exe）
-            - **linux-x86_64**：Linux（需系统自带常见 Qt 运行库，见 README）
-
-            首次运行提示：
-            - macOS：右键 → 打开（或终端执行 `xattr -cr <文件>` 后双击）
-            - Windows：SmartScreen 提示时点「更多信息 → 仍要运行」（未签名应用属正常现象）
-            - Linux：缺少运行库时 `sudo apt install libxcb-cursor0 libegl1`
+            双击 `ScanBMC-${{ env.VER }}-windows-x64.exe` 即可运行，无需安装 Python 或 .NET 运行时。
